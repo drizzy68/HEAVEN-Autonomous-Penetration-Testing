@@ -41,11 +41,11 @@ _SSH_MSG_KEXINIT = 20
 
 _WEAK_HOSTKEY: dict[str, tuple[str, str]] = {
     "ssh-dss": ("high",
-                "DSA (ssh-dss) — 1024-bit, cryptographically weak; disabled by "
+                "DSA (ssh-dss): 1024-bit, cryptographically weak; disabled by "
                 "default since OpenSSH 7.0"),
     "ssh-dss-cert-v01@openssh.com": ("high", "DSA certificate host key (ssh-dss)"),
     "ssh-rsa": ("medium",
-                "RSA host key with a SHA-1 signature (ssh-rsa) — deprecated and "
+                "RSA host key with a SHA-1 signature (ssh-rsa): deprecated and "
                 "disabled by default since OpenSSH 8.8 (SHA-1 is collision-broken); "
                 "use rsa-sha2-256 / rsa-sha2-512"),
     "ssh-rsa-cert-v01@openssh.com": ("medium",
@@ -66,9 +66,9 @@ _WEAK_KEX: dict[str, tuple[str, str]] = {
 _WEAK_CIPHER: dict[str, tuple[str, str]] = {
     "none": ("critical", "no encryption"),
     "des-cbc": ("high", "DES (56-bit)"),
-    "3des-cbc": ("medium", "3DES — 64-bit block, SWEET32-class birthday attack"),
-    "blowfish-cbc": ("medium", "Blowfish — 64-bit block"),
-    "cast128-cbc": ("medium", "CAST-128 — 64-bit block"),
+    "3des-cbc": ("medium", "3DES: 64-bit block, SWEET32-class birthday attack"),
+    "blowfish-cbc": ("medium", "Blowfish: 64-bit block"),
+    "cast128-cbc": ("medium", "CAST-128: 64-bit block"),
     "arcfour": ("medium", "RC4 stream cipher (broken)"),
     "arcfour128": ("medium", "RC4 (broken)"),
     "arcfour256": ("medium", "RC4 (broken)"),
@@ -156,8 +156,9 @@ class SSHAudit:
 
 
 def _finding(host: str, port: int, vuln_type: str, severity: str, title: str,
-             description: str, confidence: float = 0.95, cve: str = "") -> dict:
-    return {
+             description: str, confidence: float = 0.95, cve: str = "",
+             evidence: Optional[dict] = None) -> dict:
+    out = {
         "target": f"{host}:{port}",
         "vuln_type": vuln_type,
         "title": title,
@@ -167,6 +168,9 @@ def _finding(host: str, port: int, vuln_type: str, severity: str, title: str,
         "cve_id": cve,
         "source": "ssh_audit",
     }
+    if evidence:
+        out["evidence"] = dict(evidence)
+    return out
 
 
 # ── Wire parsing ──────────────────────────────────────────────────────────────
@@ -307,7 +311,13 @@ def audit_algorithms(host: str, port: int, algos: dict[str, list[str]]) -> list[
             f"SSH Server Offers Weak {label} ({', '.join(h[0] for h in hits)})",
             f"The SSH server at {host}:{port} advertises {label.lower()} that are "
             f"cryptographically weak or deprecated: {listed}. {tail}",
-            confidence=0.97))
+            confidence=0.97,
+            evidence={
+                "observed": (
+                    f"The server's SSH_MSG_KEXINIT advertised these weak "
+                    f"{label.lower()}: {listed}."),
+                "weak_algorithms": [h[0] for h in hits],
+            }))
 
     # Host keys — the headline case (ssh-dss / ssh-rsa SHA-1). A server offering
     # these for host authentication typically also accepts them for client

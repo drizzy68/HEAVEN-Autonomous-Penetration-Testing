@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 import secrets
+from typing import Optional
 from urllib.parse import urljoin
 
 try:
@@ -134,11 +135,18 @@ async def _probe_form(session: "aiohttp.ClientSession", form: dict,
             continue
 
         low = body.lower()
-        accepted = (any(s in low for s in _ACCEPT_SIGNALS)
-                    or filename.lower() in low)
         rejected = any(s in low for s in _REJECT_SIGNALS)
-        if not accepted or (rejected and filename.lower() not in low):
-            continue   # this extension was blocked — the secure behaviour; try next
+        success_signal = any(s in low for s in _ACCEPT_SIGNALS)
+        # A rejection message routinely echoes the filename back
+        # ("heaven_probe_x.php: file type not allowed"), so the filename
+        # appearing in the body only counts as acceptance when the response is
+        # NOT a rejection. Otherwise a BLOCKED upload (the secure behaviour)
+        # would be read as accepted and reported as a false unrestricted-upload
+        # high — the extension-validation message contains the extension and the
+        # filename, both of which used to flip the old `accepted` flag.
+        filename_echoed = filename.lower() in low and not rejected
+        if not (success_signal or filename_echoed):
+            continue   # blocked (secure behaviour) or unacknowledged — try next
 
         # Confirm storage/execution by fetching the file back.
         executed = stored = False
@@ -163,9 +171,15 @@ async def _probe_form(session: "aiohttp.ClientSession", form: dict,
             severity, confidence = "high", 0.85
             detail = ("the file is stored and served back verbatim from a "
                       "web-reachable path")
-        else:
+        elif success_signal:
             severity, confidence = "high", 0.7
             detail = "the server reported the upload as accepted"
+        else:
+            # The filename was echoed (and it is not a rejection) but we could
+            # neither retrieve the stored file nor observe an explicit success
+            # message — too weak to assert the flaw, since a reflected filename
+            # alone is not proof the dangerous file was stored.
+            continue
 
         return {
             "target": action,
@@ -198,7 +212,8 @@ async def _probe_form(session: "aiohttp.ClientSession", form: dict,
 
 
 async def scan_upload_forms(endpoints: list[dict], *, authorized: bool = False,
-                            timeout: float = 12.0) -> dict:
+                            timeout: float = 12.0,
+                            time_budget: Optional[float] = None) -> dict:
     """Probe every file-upload form discovered by the crawl.
 
     Gated on ``authorized`` because it writes a (benign, inert) file to the
@@ -213,18 +228,34 @@ async def scan_upload_forms(endpoints: list[dict], *, authorized: bool = False,
     if not forms:
         return {"skipped": True, "reason": "no file-upload forms discovered"}
 
+    import time as _time
+    deadline = (_time.monotonic() + time_budget) \
+        if (time_budget and time_budget > 0) else None
+    truncated = False
+
     connector = aiohttp.TCPConnector(ssl=False, limit=10)
     findings: list[dict] = []
+    tested = 0
     async with aiohttp.ClientSession(connector=connector, **aiohttp_session_kwargs()) as session:
         for form in forms:
+            if deadline is not None and _time.monotonic() >= deadline:
+                truncated = True
+                break
             try:
                 f = await _probe_form(session, form, timeout)
             except Exception:  # noqa: BLE001
                 logger.debug("upload form probe error for %s", form.get("action"),
                              exc_info=True)
                 f = None
+            tested += 1
             if f is not None:
                 findings.append(f)
 
-    return {"findings": findings, "forms_tested": len(forms),
-            "vulnerabilities": findings, "total": len(findings)}
+    out = {"findings": findings, "forms_tested": tested,
+           "vulnerabilities": findings, "total": len(findings),
+           "urls_requested": len(forms), "urls_audited": tested}
+    if truncated:
+        out["budget_exhausted"] = True
+        logger.warning("upload probe: soft budget reached; tested %d of %d form(s), "
+                       "returning partial results", tested, len(forms))
+    return out

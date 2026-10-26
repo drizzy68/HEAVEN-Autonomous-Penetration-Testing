@@ -172,14 +172,15 @@ if HAS_CLICK:
         info, init as init_module,
         install_tools as install_tools_module, knowledge,
         labs as labs_module,
-        lateral, methodology, mitre, pivot as pivot_module, plugins as plugins_module,
+        lateral, methodology, mitre, oast as oast_module,
+        pivot as pivot_module, plugins as plugins_module,
         postex as postex_module,
         quickstart as quickstart_module, replay,
         sast, sbom as sbom_module, sca as sca_module, scan, server,
         ssh as ssh_module,
         status as status_module, tickets,
         train, update as update_module, use as use_module,
-        vpn as vpn_module, watch,
+        vault as vault_module, vpn as vpn_module, watch,
     )
     ai_module.register(cli)
     analyze_module.register(cli)
@@ -211,6 +212,7 @@ if HAS_CLICK:
     labs_module.register(cli)
     lateral.register(cli)
     methodology.register(cli)
+    oast_module.register(cli)
     pivot_module.register(cli)
     mitre.register(cli)
     plugins_module.register(cli)
@@ -228,6 +230,7 @@ if HAS_CLICK:
     train.register(cli)
     update_module.register(cli)
     use_module.register(cli)
+    vault_module.register(cli)
     vpn_module.register(cli)
     watch.register(cli)
 

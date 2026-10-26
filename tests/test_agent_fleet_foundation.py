@@ -167,8 +167,9 @@ def test_brain_deterministic_floor_when_no_provider():
     assert info["tier"] == TIER_DETERMINISTIC and info["label"] == "deterministic"
     # every key the doctor/UI reads must be present and typed
     for k in ("provider", "model", "available", "rate_limited", "concurrency",
-              "local_enabled", "local_can_enable"):
+              "local_enabled", "local_can_enable", "fallback_active"):
         assert k in info
+    assert info["fallback_active"] is False  # no fallback when no provider at all
 
 
 def test_brain_tier_resolution():
@@ -177,6 +178,40 @@ def test_brain_tier_resolution():
     # rate-limited cloud is configured but not currently usable
     b = FleetBrain(gateway=_FakeGW(available=True, provider="openai", rate_limited=True))
     assert b.tier == TIER_CLOUD and b.available is False
+
+
+class _FakeGWFallback(_FakeGW):
+    """A cloud gateway that is rate-limited but can still serve via a fallback,
+    mirroring the real gateway's `has_usable_fallback` contract."""
+
+    def __init__(self, *, fallback_ready: bool, **kw):
+        super().__init__(**kw)
+        self._fallback_ready = fallback_ready
+
+    def has_usable_fallback(self) -> bool:
+        return self._fallback_ready
+
+
+def test_brain_available_via_fallback_when_cloud_cooling_down():
+    """A quota-exhausted cloud primary keeps the brain available when a keyless
+    local fallback is ready, so the LLM roles stay active on the local model."""
+    gw = _FakeGWFallback(available=True, provider="gemini", rate_limited=True,
+                         fallback_ready=True)
+    brain = FleetBrain(gateway=gw)
+    assert brain.tier == TIER_CLOUD
+    assert brain.available is True            # served by the local fallback
+    info = brain.describe()
+    assert info["rate_limited"] is True and info["fallback_active"] is True
+
+
+def test_brain_unavailable_when_cooling_down_without_fallback():
+    """No usable fallback → the brain stands down to the deterministic floor, the
+    same graceful degrade as before (zero regression without a local model)."""
+    gw = _FakeGWFallback(available=True, provider="gemini", rate_limited=True,
+                         fallback_ready=False)
+    brain = FleetBrain(gateway=gw)
+    assert brain.available is False
+    assert brain.describe()["fallback_active"] is False
 
 
 async def test_brain_think_unavailable_returns_not_ok():
@@ -192,6 +227,58 @@ async def test_brain_think_bounded_records_metrics():
     resp = await brain.think(LLMRequest(prompt="hi"))
     assert resp.ok() is True
     assert m.brain_calls == 1 and m.brain_errors == 0 and m.brain_tokens == 7
+
+
+# ── counting gateway: wrapped-agent LLM calls land in brain_calls ─────────────
+async def test_agent_gateway_counts_wrapped_agent_calls():
+    """A brain-backed agent calls the gateway directly, not think(). The counting
+    gateway makes those calls visible in brain_calls (the metric that proves the
+    fleet used AI and that the Phase-7 benchmark reads)."""
+    m = FleetMetrics()
+    canned = LLMResponse(text="ok", output_tokens=5)
+    brain = FleetBrain(
+        gateway=_FakeGW(available=True, provider="gemini", resp=canned), metrics=m)
+    gw = brain.agent_gateway
+    # delegates the attributes the agents actually read
+    assert gw.available is True
+    assert gw.provider == "gemini"      # via __getattr__
+    resp = await gw.acomplete(LLMRequest(prompt="hi"))
+    assert resp.ok() is True
+    assert m.brain_calls == 1 and m.brain_errors == 0 and m.brain_tokens == 5
+
+
+async def test_agent_gateway_counts_errors_and_reraises():
+    class _Boom:
+        available = True
+        provider = "gemini"
+        model = ""
+        rate_limited = False
+
+        async def acomplete(self, req):
+            raise RuntimeError("boom")
+
+    m = FleetMetrics()
+    brain = FleetBrain(gateway=_Boom(), metrics=m)
+    try:
+        await brain.agent_gateway.acomplete(LLMRequest(prompt="hi"))
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised  # the agent's own error handling still sees the exception
+    assert m.brain_calls == 1 and m.brain_errors == 1
+
+
+async def test_agent_gateway_and_think_do_not_double_count():
+    """think() and the counting gateway are separate paths over the same brain and
+    must each count exactly once — never the same request twice."""
+    m = FleetMetrics()
+    canned = LLMResponse(text="ok", output_tokens=1)
+    brain = FleetBrain(
+        gateway=_FakeGW(available=True, provider="ollama", resp=canned), metrics=m)
+    await brain.think(LLMRequest(prompt="a"))            # +1 via think
+    await brain.agent_gateway.acomplete(LLMRequest(prompt="b"))  # +1 via gateway
+    assert brain.agent_gateway is brain.agent_gateway    # cached, one view per brain
+    assert m.brain_calls == 2
 
 
 # ── scheduler ────────────────────────────────────────────────────────────────

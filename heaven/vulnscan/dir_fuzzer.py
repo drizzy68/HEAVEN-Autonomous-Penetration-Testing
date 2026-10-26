@@ -18,6 +18,7 @@ Key features
 from __future__ import annotations
 
 import asyncio
+import time
 import shutil
 import tempfile
 from pathlib import Path
@@ -248,6 +249,20 @@ HIT_CODES = {200, 201, 204, 301, 302, 307, 308, 401, 403, 405}
 # Codes that definitely mean not found
 MISS_CODES = {404, 410}
 
+# ── Blanket-deny (soft-401/403) collapse thresholds ───────────────────────────
+# A normal server returns 401/403 only for the few paths that genuinely exist but
+# are protected. A server, WAF or CDN in block mode returns the SAME
+# access-controlled response for EVERY path it is asked for, including the guessed
+# wordlist names that do not exist, so each probe masquerades as a protected
+# resource and floods the report with "sensitive file" findings for links that
+# cannot be opened. The tell is scale plus uniformity: many access-controlled hits
+# on one host whose responses collapse to a tiny set of sizes. _DENY_MIN keeps a
+# handful of genuinely protected paths out of the collapse; the size bucket
+# tolerates a deny page that varies by a few bytes (e.g. a per-request nonce).
+_DENY_MIN = 10
+_DENY_DISTINCT_MAX = 3
+_DENY_SIZE_BUCKET = 128
+
 WILDCARD_SAMPLE = "h3av3n_wildcard_probe_9z8x7"
 # A second, deliberately LONGER non-existent path. Probing two random paths of
 # different lengths reveals soft-404 pages that reflect the requested path
@@ -312,6 +327,7 @@ class DirectoryFuzzer:
         recursive: bool = True,
         max_depth: int = 2,
         extensions: Optional[list[str]] = None,
+        time_budget: Optional[float] = None,
     ) -> None:
         self._concurrency = concurrency
         self._delay = request_delay
@@ -323,6 +339,15 @@ class DirectoryFuzzer:
         self._sem = asyncio.Semaphore(concurrency)
         self._findings: list[dict] = []
         self._seen_paths: set[str] = set()
+        # Soft wall-clock deadline. The per-path fan-out below scales with the
+        # wordlist (hundreds-thousands of probes per target), so on a slow host
+        # it can outrun the orchestrator's hard task timeout and lose EVERY path
+        # it found. With a budget, each _scan_target keeps the probes completed
+        # before the deadline and stops launching more, and the ffuf per-target
+        # loop breaks out, so the task returns partial results instead of zero.
+        self._time_budget = time_budget
+        self._deadline: Optional[float] = None
+        self._truncated = False
         # Set True when the fuzz session carries an auth cookie jar. While
         # authenticated, the fuzzer must never GET a session-destroying path
         # (/logout, /signout, …): the app tears the shared session down
@@ -482,6 +507,15 @@ class DirectoryFuzzer:
                     ):
                         return None
         elif wildcard:
+            # A server that returned this SAME access-controlled status for the
+            # known-nonexistent random probes denies every path: an identical
+            # 401/403 here is the blanket policy, not a discovered protected
+            # resource. Size is ignored on purpose, because a deny edge serves
+            # varying stub/challenge pages and that variance must not resurrect a
+            # non-finding (a blanket-403 CDN leaked dozens of "sensitive file"
+            # hits this way, none of them openable).
+            if _blanket_denies(wildcard, status):
+                return None
             # Same status + size inside the observed catch-all band → noise.
             if wildcard["status"] == status and wildcard["lo"] <= size <= wildcard["hi"]:
                 return None
@@ -505,7 +539,7 @@ class DirectoryFuzzer:
             "vuln_type": "directory_listing" if path.endswith("/") else "sensitive_file",
             "title": title,
             "severity": severity,
-            "confidence": 0.90,
+            "confidence": _confidence_for(status),
             "evidence": {
                 "status_code": status,
                 "response_size": size,
@@ -550,7 +584,23 @@ class DirectoryFuzzer:
         ]
         self._seen_paths.update(candidate_urls)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Budget-aware per-path fan-out: this is the sweep that scales with the
+        # wordlist, so on a slow host it is what outruns the task timeout. Keep
+        # the probes that finished before the deadline; stop awaiting the rest.
+        remaining: Optional[float] = None
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                self._truncated = True
+                # Close the coroutines we built but will not await, so no
+                # "coroutine was never awaited" warning escapes.
+                for _c in tasks:
+                    _c.close()
+                return []
+        from heaven.utils.fanout import gather_budgeted
+        results, _trunc = await gather_budgeted(tasks, time_budget=remaining)
+        if _trunc:
+            self._truncated = True
         findings: list[dict] = []
         dirs_found: list[str] = []
 
@@ -650,10 +700,15 @@ class DirectoryFuzzer:
                     continue
                 findings.append({
                     "target": url,
-                    "vuln_type": "sensitive_file",
+                    # Match the native engine's classification (see _scan_target):
+                    # a served directory (trailing slash) is a directory_listing,
+                    # not a sensitive_file. The ffuf path used to hardcode
+                    # "sensitive_file" for every hit, mislabelling a public
+                    # /images/ autoindex as a sensitive-file exposure.
+                    "vuln_type": "directory_listing" if path.endswith("/") else "sensitive_file",
                     "title": _path_title(path, status, served=_served(status)),
                     "severity": _severity_for(path, status),
-                    "confidence": 0.90,
+                    "confidence": _confidence_for(status),
                     "evidence": {
                         "status_code": status,
                         "response_size": result.get("length", 0),
@@ -682,6 +737,12 @@ class DirectoryFuzzer:
         if not targets:
             return {"findings": [], "urls_tested": 0, "error": "no targets"}
 
+        # Arm the soft deadline for this sweep (see __init__). _scan_target and
+        # the ffuf loop below both honour it so a slow host returns partial paths.
+        self._deadline = (time.monotonic() + self._time_budget) \
+            if (self._time_budget and self._time_budget > 0) else None
+        self._truncated = False
+
         # Try ffuf first (per target); fall back to the native async engine for
         # any target where ffuf could not run — a missing binary, an unsupported
         # flag, a non-zero exit or an unparseable output file (``_run_ffuf``
@@ -691,7 +752,13 @@ class DirectoryFuzzer:
         native_targets: list[str] = list(targets)
         if shutil.which("ffuf"):
             native_targets = []
-            for url in targets:
+            for _i, url in enumerate(targets):
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    self._truncated = True
+                    logger.warning(
+                        "DirFuzzer (ffuf): soft budget reached; %d of %d target(s) "
+                        "fuzzed, returning partial results", _i, len(targets))
+                    break
                 results = await self._run_ffuf(url)
                 if results is None:
                     native_targets.append(url)   # ffuf failed → native fallback
@@ -702,8 +769,13 @@ class DirectoryFuzzer:
                             f"{len(targets)} targets")
                 deduped_ffuf = self._dedup(all_findings)
                 await self._capture_responses(deduped_ffuf)
-                return {"findings": deduped_ffuf,
+                deduped_ffuf = self._collapse_soft200_catchall(deduped_ffuf)
+                deduped_ffuf = self._collapse_blanket_deny(deduped_ffuf)
+                _out = {"findings": deduped_ffuf,
                         "urls_tested": len(targets), "error": None}
+                if self._truncated:
+                    _out["budget_exhausted"] = True
+                return _out
             logger.info("DirFuzzer: ffuf unavailable/failed for %d/%d target(s): "
                         "native engine covers them", len(native_targets), len(targets))
 
@@ -731,8 +803,14 @@ class DirectoryFuzzer:
 
         deduped = self._dedup(all_findings)
         await self._capture_responses(deduped)
+        deduped = self._collapse_soft200_catchall(deduped)
+        deduped = self._collapse_blanket_deny(deduped)
         logger.info(f"DirFuzzer: {len(deduped)} unique paths found")
-        return {"findings": deduped, "urls_tested": len(targets), "error": None}
+        _out = {"findings": deduped, "urls_tested": len(targets), "error": None}
+        if self._truncated:
+            _out["budget_exhausted"] = True
+            logger.warning("DirFuzzer: soft budget reached; returning partial paths")
+        return _out
 
     async def _capture_responses(self, findings: list[dict]) -> None:
         """Attach the real HTTP response to each discovered path (Proof of issue).
@@ -788,6 +866,108 @@ class DirectoryFuzzer:
                 deduped.append(f)
         return deduped
 
+    @staticmethod
+    def _collapse_soft200_catchall(findings: list[dict]) -> list[dict]:
+        """Collapse per-host status-200 hits that return a BYTE-IDENTICAL body.
+
+        A server answering several probed paths with the same 200 page is a
+        catch-all for that path family: a live scan of www.certifiedhacker.com
+        returned the identical cPanel-redirect page for /cpanel, /whm AND the
+        non-existent /controlpanel, so three "sensitive path discovered"
+        findings triple-counted one resource and asserted a path (/controlpanel)
+        that is not really there. Keep ONE representative (shortest path) per
+        identical 200 body on a host and record the siblings under
+        ``evidence.also_served``.
+
+        The random-path wildcard filter misses this because random probes land
+        on the real site (SPA/404), not on this narrower cPanel-alias catch-all.
+        Scoped to 200 on purpose: a shared 401/403/301 body is the server's
+        generic auth/redirect page, where each protected or redirected path is a
+        real, distinct observation, so those are left untouched. A finding whose
+        body was not captured is also left as-is (nothing to compare)."""
+        by_body: dict[tuple[str, str], list[dict]] = {}
+        passthrough: list[dict] = []
+        for f in findings:
+            ev = f.get("evidence") if isinstance(f, dict) else None
+            body = (ev or {}).get("response_body") if isinstance(ev, dict) else None
+            if isinstance(ev, dict) and ev.get("status_code") == 200 and body:
+                host = urlparse(f.get("target", "")).netloc
+                by_body.setdefault((host, body), []).append(f)
+            else:
+                passthrough.append(f)
+        if not any(len(g) > 1 for g in by_body.values()):
+            return findings  # nothing to collapse — preserve original list/order
+        out: list[dict] = list(passthrough)
+        for group in by_body.values():
+            if len(group) == 1:
+                out.append(group[0])
+                continue
+            rep = min(group, key=lambda g: len(
+                (g.get("evidence") or {}).get("path") or g.get("target") or ""))
+            siblings = sorted({
+                (g.get("evidence") or {}).get("path") or g.get("target", "")
+                for g in group if g is not rep})
+            rep.setdefault("evidence", {})["also_served"] = siblings
+            out.append(rep)
+        return out
+
+    @staticmethod
+    def _collapse_blanket_deny(findings: list[dict]) -> list[dict]:
+        """Drop access-controlled (401/403) hits on a host that denies EVERY path.
+
+        The fuzzer reads a 401/403 as "this path exists but is protected", which
+        is true on a normal server. A server, WAF or CDN in block mode instead
+        returns the SAME access-controlled response for every path it is asked
+        for, including the guessed wordlist names that do not exist, so each probe
+        masquerades as a protected resource and the report fills with 'sensitive
+        file' findings for links that cannot be opened (observed live against
+        www.ashirwadsweets.com: 96 paths, all 403, two distinct deny pages).
+
+        The tell is scale plus uniformity, read off the scan's OWN captured
+        responses so it holds even for a WAF that only starts blocking mid-scan (a
+        state a later re-probe would miss): when a host produced at least
+        ``_DENY_MIN`` access-controlled hits whose response sizes collapse to at
+        most ``_DENY_DISTINCT_MAX`` buckets, none carries a per-resource signal
+        and all are dropped. A few protected paths (< ``_DENY_MIN``), or many that
+        each render distinctly, are left untouched, because that is honest
+        discovery. Served resources (2xx) are never considered here, so a real
+        exposed file keeps its finding.
+
+        This runs on both backends' merged findings, so it also covers the ffuf
+        path, whose own ``-ac`` calibration cannot model a deny edge that serves
+        more than one page size."""
+        by_host: dict[str, list[dict]] = {}
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            ev = f.get("evidence") if isinstance(f.get("evidence"), dict) else {}
+            status = ev.get("status_code") or ev.get("status")
+            if status in (401, 403):
+                host = urlparse(f.get("target", "")).netloc
+                by_host.setdefault(host, []).append(f)
+        drop: set[int] = set()
+        denied_hosts = 0
+        for group in by_host.values():
+            if len(group) < _DENY_MIN:
+                continue
+            buckets: set[int] = set()
+            for f in group:
+                size = (f.get("evidence") or {}).get("response_size")
+                buckets.add(int(size) // _DENY_SIZE_BUCKET
+                            if isinstance(size, int) else -1)
+            if len(buckets) <= _DENY_DISTINCT_MAX:
+                denied_hosts += 1
+                for f in group:
+                    drop.add(id(f))
+        if not drop:
+            return findings
+        kept = [f for f in findings if id(f) not in drop]
+        logger.info(
+            "DirFuzzer: dropped %d blanket-deny 401/403 hit(s) on %d host(s) that "
+            "answer every path with the same access-controlled response",
+            len(findings) - len(kept), denied_hosts)
+        return kept
+
 
 # ─────────────────────────────────────────────────────────────────
 # Helpers
@@ -797,6 +977,21 @@ def _served(status: int) -> bool:
     """True when a status means the resource was actually served (a body returned),
     as opposed to access-controlled (401/403) or redirected (3xx)."""
     return status in (200, 201, 204, 405, 500)
+
+
+def _blanket_denies(wildcard: Optional[dict], status: int) -> bool:
+    """True when the catch-all model shows the server returns THIS same
+    access-controlled status (401/403) for known-nonexistent random paths.
+
+    ``_detect_wildcard`` records ``status`` only when every random nonexistent
+    probe shared one status. When that status is a 401/403, the server denies
+    every path it is asked for, so a probed path's identical 401/403 is the
+    blanket policy and not a discovered protected resource. Returns False for a
+    server that honestly 404s random paths (no catch-all) or whose catch-all is a
+    served/redirect status handled elsewhere."""
+    if not wildcard:
+        return False
+    return status in (401, 403) and wildcard.get("status") == status
 
 
 def _is_git_vcs_path(p: str) -> bool:
@@ -869,6 +1064,20 @@ def _severity_for(path: str, status: int) -> str:
     return "info"
 
 
+def _confidence_for(status: int) -> float:
+    """Status-aware confidence, mirroring :func:`_severity_for`.
+
+    A resource actually SERVED (2xx) is a confident exposure. A path that only
+    exists behind an access control (401/403 — the secure state) or that
+    redirects (3xx) is weak discovery, not a confirmed exposure — so it carries a
+    deliberately low confidence (< 0.5, no CVE). That is exactly the signal
+    ``cvss.is_unconfirmed_finding`` keys on to cap the severity to the detector's
+    honest low/info band, instead of letting a generic class CVSS inflate a bare
+    `/.svn` 301 redirect into a MEDIUM "sensitive file". A served hit is
+    unaffected and still reports at full confidence."""
+    return 0.90 if _served(status) else 0.40
+
+
 def _path_title(path: str, status: int, served: bool = True) -> str:
     p = path.lower()
     # Access-controlled / redirecting paths exist but are NOT exposed — never
@@ -935,6 +1144,7 @@ async def fuzz_directories(
     targets: list[str],
     stealth_level: str = "normal",
     tech_hints: Optional[list[str]] = None,
+    time_budget: Optional[float] = None,
 ) -> dict:
     """
     Entry point called from the orchestrator.
@@ -965,5 +1175,6 @@ async def fuzz_directories(
         concurrency=concurrency,
         request_delay=delay,
         extensions=extra_exts,
+        time_budget=time_budget,
     )
     return await fuzzer.fuzz(targets)

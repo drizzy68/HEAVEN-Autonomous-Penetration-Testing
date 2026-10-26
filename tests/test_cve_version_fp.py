@@ -78,11 +78,67 @@ def test_apache_2430_still_matches_24_cves():
     assert "CVE-2021-40438" in ids   # mod_proxy SSRF, <=2.4.48
 
 
+def test_apache_cve_titles_and_cwes_match_the_real_vulnerability():
+    """Two inline records carried the wrong vulnerability class — a client who
+    looked the CVE up would find an unrelated description. CVE-2022-22721 is an
+    integer overflow (CWE-190), NOT "SSRF via mod_lua" (CWE-918); CVE-2022-31813
+    is an IP-auth bypass via dropped X-Forwarded-* headers (CWE-348), NOT HTTP
+    request smuggling (CWE-444). Pin the corrected metadata."""
+    recs = {r.cve_id: r for r in lookup_inline_cves("apache_http_server", "2.4.7")}
+    overflow = recs["CVE-2022-22721"]
+    assert overflow.cwe == "CWE-190"
+    assert "ssrf" not in overflow.title.lower() and "mod_lua" not in overflow.title.lower()
+    assert "overflow" in overflow.title.lower()
+    authbypass = recs["CVE-2022-31813"]
+    assert authbypass.cwe == "CWE-348"
+    assert "smuggling" not in authbypass.title.lower()
+    assert "x-forwarded" in authbypass.title.lower() or "authentication bypass" in authbypass.title.lower()
+
+
 def test_apache_2453_above_ceiling_not_matched():
     # A patched 2.4.60 must not pick up ceilings it is above.
     ids = {r.cve_id for r in lookup_inline_cves("apache_http_server", "2.4.60")}
     assert "CVE-2019-10082" not in ids
     assert "CVE-2021-40438" not in ids
+
+
+def test_cve_2020_13950_floored_at_introduced_version():
+    """CVE-2020-13950's mod_proxy_http NULL-deref code path was introduced in
+    2.4.41 (NVD window 2.4.41-2.4.46, fixed 2.4.47), so a bare >=2.4.0 branch
+    floor flagged ubiquitous older 2.4 builds — a live full scan of
+    scanme.nmap.org reported it as a HIGH on Apache 2.4.7 (Ubuntu 14.04), which
+    predates the vulnerable code by 34 point releases. Floor at the
+    introduced-in version so only the real 2.4.41-2.4.46 window matches."""
+    for safe in ("2.4.7", "2.4.30", "2.4.40"):
+        ids = {r.cve_id for r in lookup_inline_cves("apache_http_server", safe)}
+        assert "CVE-2020-13950" not in ids, f"{safe} predates the 2.4.41 code path"
+    for vuln in ("2.4.41", "2.4.43", "2.4.46"):
+        ids = {r.cve_id for r in lookup_inline_cves("apache_http_server", vuln)}
+        assert "CVE-2020-13950" in ids, f"{vuln} is inside the real affected window"
+    # The fixed release (2.4.47) is above the ceiling.
+    assert "CVE-2020-13950" not in {
+        r.cve_id for r in lookup_inline_cves("apache_http_server", "2.4.47")}
+
+
+# ── IIS HTTP Protocol Stack (http.sys) RCEs are IIS 10.0-only ─────────────────
+# CVE-2021-31166 / CVE-2022-21907 live in the http.sys driver that ships only
+# with IIS 10.0 (Windows 10 2004+/Server 2019+). A bare "<=10.0" ceiling swept
+# IIS 6.0/7.5/8.5 into two CRITICAL findings those older generations cannot have.
+def test_iis_older_generations_not_flagged_with_httpsys_rce():
+    for ver in ("7.5", "8.5"):
+        ids = {r.cve_id for r in lookup_inline_cves("microsoft_iis", ver)}
+        assert "CVE-2021-31166" not in ids, f"http.sys RCE FP on IIS {ver}"
+        assert "CVE-2022-21907" not in ids, f"http.sys RCE FP on IIS {ver}"
+    # IIS 6.0 keeps only its own WebDAV RCE, not the http.sys criticals.
+    ids6 = {r.cve_id for r in lookup_inline_cves("microsoft_iis", "6.0")}
+    assert ids6 == {"CVE-2017-7269"}
+
+
+def test_iis_100_still_flagged_with_httpsys_rce():
+    # The IIS 10.0 generation (the real affected set) must still match both.
+    ids = {r.cve_id for r in lookup_inline_cves("microsoft_iis", "10.0")}
+    assert "CVE-2021-31166" in ids
+    assert "CVE-2022-21907" in ids
 
 
 def test_openssh_47_not_flagged_with_62plus_cve():
@@ -128,6 +184,27 @@ def test_proxycommand_51385_fixed_in_96_not_flagged():
     assert "CVE-2023-51385" not in {r.cve_id for r in lookup_inline_cves("openssh", "9.6p1")}
     assert "CVE-2023-51385" not in {r.cve_id for r in lookup_inline_cves("openssh", "9.6")}
     assert "CVE-2023-51385" in {r.cve_id for r in lookup_inline_cves("openssh", "9.5p1")}
+
+
+def test_client_side_ssh_cves_dropped_for_scanned_server():
+    # scanme.nmap.org's OpenSSH 6.6.1p1 matches four client-side-only CVEs
+    # (ssh-agent / scp / ProxyCommand). HEAVEN scans the sshd SERVER, which is not
+    # remotely attackable via any of them, so they must not surface as service
+    # findings. The server-side positives (username enum, Terrapin) must remain.
+    raw = {r.cve_id for r in lookup_inline_cves("openssh", "6.6.1p1")}
+    kept = {r.cve_id for r in CM._drop_client_side_only(lookup_inline_cves("openssh", "6.6.1p1"))}
+    for client_side in ("CVE-2023-38408", "CVE-2023-51385", "CVE-2020-15778", "CVE-2019-6111"):
+        assert client_side in raw                # version genuinely matches
+        assert client_side not in kept           # ...but suppressed as client-side
+    assert {"CVE-2018-15473", "CVE-2016-20012", "CVE-2023-48795"} <= kept  # server-side intact
+
+
+def test_client_side_drop_is_unconditional():
+    # Unlike the distro-backport drop, client-side suppression does not depend on
+    # the banner: no version or build makes a scanned server exposed to a purely
+    # client-side bug. A from-source (non-distro) OpenSSH is treated the same.
+    kept = {r.cve_id for r in CM._drop_client_side_only(lookup_inline_cves("openssh", "8.0p1"))}
+    assert "CVE-2020-15778" not in kept          # scp CVE dropped regardless of distro token
 
 
 def test_docker_registry_not_flagged_with_engine_cves():
@@ -203,6 +280,44 @@ def test_live_feed_version_confirmed_hit_emitted_individually():
     assert len(hits) == 1
     assert hits[0]["vuln_type"] == "vulnerable_service"
     assert hits[0]["confidence"] == 0.85
+
+
+def test_client_side_cve_ids_cover_inline_and_live_only():
+    ids = CM._client_side_cve_ids()
+    assert "CVE-2025-26465" in ids          # live-only addition (VerifyHostKeyDNS MITM)
+    assert "CVE-2023-38408" in ids          # inline ssh-agent client CVE
+    assert "CVE-2020-15778" in ids          # inline scp client CVE
+    # Server-side 2025 OpenSSH CVEs must NOT be in the client-side set.
+    assert "CVE-2025-26466" not in ids      # pre-auth ping/pong DoS (server)
+    assert "CVE-2025-32728" not in ids      # DisableForwarding sshd (server)
+
+
+def test_live_feed_drops_client_side_cve_on_server():
+    """Regression (live www.certifiedhacker.com, OpenSSH 9.9): the live NVD path
+    has no client_side flag, so CVE-2025-26465 (VerifyHostKeyDNS MITM — a CLIENT
+    weakness) was asserted as a medium server 'vulnerable_service' on port 22.
+    The client-side filter now drops it from the live path while keeping the
+    genuinely server-side OpenSSH CVEs."""
+    class Feed:
+        available = True
+
+        async def discover_for_service(self, service, banner="", version=""):
+            return [
+                _FakeLiveCVE("CVE-2025-26465", 6.8, True),   # client-side → drop
+                _FakeLiveCVE("CVE-2025-26466", 5.9, True),   # server DoS → keep
+                _FakeLiveCVE("CVE-2025-32728", 4.3, True),   # server config → keep
+            ]
+
+    host = {"host": "www.certifiedhacker.com", "open_ports": [
+        {"port": 22, "service": "ssh", "banner": "SSH-2.0-OpenSSH_9.9",
+         "version": "9.9", "product": "OpenSSH"},
+    ]}
+    out = asyncio.run(CM.map_vulnerabilities([host], nvd_client=None,
+                                             live_feed=Feed(), max_live_lookups=5))
+    cves = {v.get("cve") for v in out}
+    assert "CVE-2025-26465" not in cves          # client-side dropped
+    assert "CVE-2025-26466" in cves              # server-side kept
+    assert "CVE-2025-32728" in cves              # server-side kept
 
 
 # ── 4. Old-version live-feed fallback (`not inline_cves`, not `product not in DB`) ─

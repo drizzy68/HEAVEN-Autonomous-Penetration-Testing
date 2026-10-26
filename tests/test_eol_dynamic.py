@@ -160,6 +160,66 @@ def test_currency_no_latest_field_no_finding(monkeypatch):
     assert res["total"] == 0
 
 
+# ── recently-superseded fast-cadence EOL vs genuine abandonment ───────────────
+# A short-lived release branch (nginx-style) retired only because a newer line
+# shipped, while that newer line is still supported, is a patch-currency gap — NOT
+# the abandoned-software exposure that reconcile_severity escalates to High. Dates
+# are relative to today so the support-lifetime / recency relationships never drift.
+
+def test_recently_superseded_short_lived_branch_is_currency_not_abandoned(monkeypatch):
+    from heaven.utils.cvss import reconcile_severity
+    eol3 = _iso_months_ago(3)
+    cycles = [
+        {"cycle": "1.31", "releaseDate": _iso_months_ago(3), "eol": "2999-01-01"},
+        {"cycle": "1.30", "releaseDate": _iso_months_ago(4), "eol": "2999-01-01"},
+        # 1.29 lived ~11 months (14mo ago → EOL 3mo ago): a fast-cadence branch.
+        {"cycle": "1.29", "releaseDate": _iso_months_ago(14), "eol": eol3},
+    ]
+    _mock_feed(monkeypatch, cycles)
+    res = _run(eol.scan_eol_from_net(_net("nginx", "1.29.8")))
+    assert res["total"] == 1
+    f = res["findings"][0]
+    assert f["vuln_type"] == "outdated_patch_level"
+    assert f["severity"] == "medium"
+    assert f["evidence"]["recently_superseded"] is True
+    assert f["evidence"]["newer_cycle"] == "1.31"
+    assert f["evidence"]["eol_date"] == eol3
+    # The whole point of the fix: reconcile_severity must NOT escalate it to the
+    # High unsupported_software band (class base 7.4) — it stays Medium.
+    assert reconcile_severity(dict(f))["severity"] == "medium"
+
+
+def test_recent_eol_long_support_line_stays_unsupported(monkeypatch):
+    from heaven.utils.cvss import reconcile_severity
+    # A multi-year support line (born ~70mo ago, EOL ~6mo ago — a genuine 5-year
+    # end of support, PostgreSQL-style) is NOT softened even though newer supported
+    # lines exist and the EOL is recent: that line is really abandoned now.
+    cycles = [
+        {"cycle": "18", "releaseDate": _iso_months_ago(1), "eol": "2999-01-01"},
+        {"cycle": "17", "releaseDate": _iso_months_ago(13), "eol": "2999-01-01"},
+        {"cycle": "13", "releaseDate": _iso_months_ago(70), "eol": _iso_months_ago(6)},
+    ]
+    _mock_feed(monkeypatch, cycles)
+    res = _run(eol.scan_eol_from_net(_net("postgresql", "13.1", port=5432)))
+    assert res["total"] == 1
+    f = res["findings"][0]
+    assert f["vuln_type"] == "unsupported_software"
+    assert reconcile_severity(dict(f))["severity"] == "high"
+
+
+def test_recent_short_lived_but_no_supported_successor_stays_unsupported(monkeypatch):
+    # Short-lived branch, recent EOL, but every newer line is ALSO EOL (the product
+    # itself is abandoned) → remains unsupported_software, never softened.
+    cycles = [
+        {"cycle": "1.29", "releaseDate": _iso_months_ago(14), "eol": _iso_months_ago(3)},
+        {"cycle": "1.28", "releaseDate": _iso_months_ago(26), "eol": _iso_months_ago(15)},
+    ]
+    _mock_feed(monkeypatch, cycles)
+    res = _run(eol.scan_eol_from_net(_net("nginx", "1.29.8")))
+    assert res["total"] == 1
+    assert res["findings"][0]["vuln_type"] == "unsupported_software"
+
+
 def test_slug_detection():
     assert eol._endoflife_slug("nginx", "") == "nginx"
     assert eol._endoflife_slug("Apache", "httpd") == "apache"
@@ -172,15 +232,21 @@ def test_slug_detection():
 # FortiOS is tracked WITHOUT a `latest` field but WITH per-cycle release dates, so
 # the release-line currency path uses live dates (nothing hard-coded). Structure
 # mirrors the real endoflife.date/api/fortios.json response.
+# Dates are RELATIVE to today (not fixed calendar dates) so the maturity and EOL
+# relationships never drift into a false verdict as time passes: 8.0 stays "too new
+# to demand" (< 12 months GA), 7.6/7.4/7.2 stay mature newer lines, and every cycle
+# here stays supported (eol far in the future). Hard-coding the dates instead made
+# this fixture a time-bomb (8.0 would cross the 12-month maturity floor, and 7.2's
+# fixed eol would lapse, flipping the assertions below on a specific calendar day).
 _FORTIOS = [
-    {"cycle": "8.0", "releaseDate": "2026-04-21", "eol": "2030-10-21",
-     "support": "2029-04-21", "lts": False},
-    {"cycle": "7.6", "releaseDate": "2024-07-25", "eol": "2030-01-25",
-     "support": "2028-07-25", "lts": False},
-    {"cycle": "7.4", "releaseDate": "2023-05-11", "eol": "2028-11-11",
-     "support": "2027-05-11", "lts": False},
-    {"cycle": "7.2", "releaseDate": "2022-03-31", "eol": "2026-12-30",
-     "support": "2025-03-31", "lts": False},
+    {"cycle": "8.0", "releaseDate": _iso_months_ago(5), "eol": "2999-01-01",
+     "support": "2999-01-01", "lts": False},
+    {"cycle": "7.6", "releaseDate": _iso_months_ago(26), "eol": "2999-01-01",
+     "support": "2999-01-01", "lts": False},
+    {"cycle": "7.4", "releaseDate": _iso_months_ago(42), "eol": "2999-01-01",
+     "support": "2999-01-01", "lts": False},
+    {"cycle": "7.2", "releaseDate": _iso_months_ago(54), "eol": "2999-01-01",
+     "support": "2999-01-01", "lts": False},
 ]
 
 
@@ -209,10 +275,44 @@ def test_fortios_on_newest_mature_line_no_finding(monkeypatch):
 
 def test_fortios_eol_line_takes_priority(monkeypatch):
     # A past-EOL FortiOS line is reported as unsupported, not merely behind.
-    cycles = [{"cycle": "6.4", "releaseDate": "2020-05-01", "eol": "2023-09-28"}] \
-        + _FORTIOS
+    cycles = [{"cycle": "6.4", "releaseDate": _iso_months_ago(78),
+               "eol": "2000-01-01"}] + _FORTIOS
     _mock_feed(monkeypatch, cycles)
     res = _run(eol.scan_eol_from_net(
         _net("FortiGate", "6.4.9", banner="FortiOS 6.4.9", port=443)))
     assert res["total"] == 1
     assert res["findings"][0]["vuln_type"] == "unsupported_software"
+
+
+# ── per-product version attribution (static table) ─────────────────────────────
+# nmap reports a single Apache service as one line whose extrainfo names other
+# products: "Apache httpd 2.4.58 ((Ubuntu) PHP/8.2.10)". The structured version
+# (2.4.58) is Apache's; a secondary rule (PHP) that borrowed it invented a
+# nonexistent "PHP 2.4.58" that always fell below the cutoff — a false positive.
+
+def test_eol_secondary_product_does_not_borrow_primary_version():
+    """A supported PHP in an Apache service's extrainfo must NOT be flagged EOL
+    by reading the Apache version (the old `_parse_version(version)` bug)."""
+    banner = "Apache httpd 2.4.58 ((Ubuntu) PHP/8.2.10)"
+    out = eol._product_findings("10.0.0.1:80", "Apache httpd", "2.4.58", banner)
+    assert out == [], [f["title"] for f in out]
+
+
+def test_eol_secondary_product_reports_its_own_version():
+    """When the secondary product really is EOL, the finding carries ITS version
+    (PHP 5.5.9), never the primary Apache version."""
+    banner = "Apache httpd 2.4.7 ((Ubuntu) PHP/5.5.9-1ubuntu4)"
+    out = eol._product_findings("10.0.0.1:80", "Apache httpd", "2.4.7", banner)
+    php = [f for f in out if f["evidence"]["product"] == "PHP"]
+    assert len(php) == 1
+    assert php[0]["evidence"]["detected_version"] == "5.5.9"
+    assert "5.5.9" in php[0]["title"] and "2.4.7" not in php[0]["title"]
+
+
+def test_eol_primary_product_still_fires_with_own_version():
+    """Sanity: a genuinely old primary product still fires, with its version."""
+    out = eol._product_findings("10.0.0.1:80", "Apache httpd", "2.2.8",
+                                "Apache httpd 2.2.8 ((Debian))")
+    apache = [f for f in out if f["evidence"]["product"] == "Apache HTTP Server"]
+    assert len(apache) == 1
+    assert apache[0]["evidence"]["detected_version"] == "2.2.8"

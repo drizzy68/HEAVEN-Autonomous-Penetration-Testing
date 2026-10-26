@@ -764,14 +764,27 @@ async def _fuzz_parameters(session: "aiohttp.ClientSession",
     """
     findings: list[dict] = []
 
-    # Baseline
+    # Baseline — fetched TWICE so the page's own request-to-request length jitter
+    # (timestamps, CSRF tokens, ads, rotating content) is measured. A dynamic page
+    # routinely varies by >100 bytes between two identical requests, so a bare
+    # length-diff against a single baseline would flag every probed name as a
+    # "discovered" hidden parameter. The length signal must exceed this jitter, not
+    # just a fixed floor (same noise-floor discipline the injection boolean oracle
+    # and cache-poison checks use).
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             base_status = r.status
             base_body   = await r.text()
             base_len    = len(base_body)
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r2:
+            base_len2 = len(await r2.text())
     except Exception:
         return findings
+    jitter = abs(base_len - base_len2)
+    # Required absolute length change: the larger of a fixed floor and twice the
+    # observed jitter, so a stable page keeps the sensitive 100-byte floor while a
+    # noisy page demands a change clearly beyond its own variance.
+    len_threshold = max(100, jitter * 2)
 
     # Parameters already present in the URL are not "hidden" — they are visible,
     # in-request inputs (and are covered by the injection/redirect scanners). Only
@@ -779,6 +792,31 @@ async def _fuzz_parameters(session: "aiohttp.ClientSession",
     base_params = set(
         urllib.parse.parse_qs(urllib.parse.urlparse(url).query).keys()
     )
+
+    # Negative control: probe a random, almost-certainly-nonexistent parameter.
+    # Many pages echo the whole query string into a canonical <link>, a form
+    # action, or a self-referential URL, so appending ANY name grows the body by a
+    # constant amount; others gate every query on auth and flip to a 401/403 for
+    # any param. Without this control the discovery fired on every probed name with
+    # an identical len_diff (observed live: debug/internal/test all len_diff=121),
+    # or on a param that merely flipped the response to a denial. A real hidden
+    # parameter must move the response MORE than a junk name does, or produce a
+    # status/reflection the junk name does not. (Same control discipline as the HPP
+    # check below.)
+    ctrl_status = base_status
+    ctrl_len_diff = 0
+    ctrl_reflected = False
+    try:
+        ctrl_name = "hvn_" + secrets.token_hex(4)
+        ctrl_url = url + ("&" if "?" in url else "?") + f"{ctrl_name}=HEAVEN_PROBE"
+        async with session.get(ctrl_url,
+                               timeout=aiohttp.ClientTimeout(total=8)) as rc:
+            ctrl_body = await rc.text()
+            ctrl_status = rc.status
+            ctrl_len_diff = abs(len(ctrl_body) - base_len)
+            ctrl_reflected = "HEAVEN_PROBE" in ctrl_body
+    except Exception:
+        logger.debug("suppressed non-fatal exception", exc_info=True)
 
     sem = asyncio.Semaphore(10)
     interesting: list[dict] = []
@@ -793,22 +831,84 @@ async def _fuzz_parameters(session: "aiohttp.ClientSession",
                                        timeout=aiohttp.ClientTimeout(total=8)) as r:
                     body = await r.text()
                     body_len = len(body)
-                    # Significant response change = parameter is processed
-                    if (r.status != base_status or
-                            abs(body_len - base_len) > 100 or
-                            "HEAVEN_PROBE" in body):
+                    # Processed-parameter signals: a verbatim reflection of our
+                    # unique probe (strong), a status change, or a length change
+                    # that clears the page's measured jitter floor (weak but no
+                    # longer a bare 100-byte fixed cut on a noisy page). Each signal
+                    # must EXCEED the junk-param control, otherwise it is structural
+                    # (the page reacts the same way to any appended query param) and
+                    # names no actual hidden parameter.
+                    reflected = "HEAVEN_PROBE" in body
+                    status_signal = (r.status != base_status
+                                     and r.status != ctrl_status)
+                    len_signal = (abs(body_len - base_len)
+                                  > max(len_threshold, ctrl_len_diff + jitter))
+                    refl_signal = reflected and not ctrl_reflected
+                    if status_signal or len_signal or refl_signal:
                         interesting.append({
                             "param": param,
                             "status": r.status,
                             "len_diff": abs(body_len - base_len),
-                            "reflected": "HEAVEN_PROBE" in body,
+                            "reflected": refl_signal,
                         })
             except Exception:
                 logger.debug("suppressed non-fatal exception", exc_info=True)
 
     await asyncio.gather(*[_try_param(p) for p in _HIDDEN_PARAMS])
 
-    for item in interesting:
+    # Sequential re-confirmation (reproduce-first). The discovery phase above fans
+    # out up to 10 probes at once; a rate-limited or connection-throttled server
+    # answers part of that burst with a load-shed variant that has nothing to do
+    # with the probed name (observed live on cPanel login ports: random junk names
+    # flipped to a 401 page exactly 121 bytes longer than the 200 baseline, purely
+    # because they rode in the concurrent wave). The negative control is measured
+    # once, on its own, so it never sees that load and cannot cancel the artifact.
+    # Re-fetch each surviving candidate ALONE, next to a fresh junk control fetched
+    # the same way, and keep only the signals that persist without the burst: a
+    # genuine hidden parameter changes the response whether or not it was in a wave;
+    # a load artifact does not reproduce in a lone request.
+    # The confirmation is sequential and only runs on candidates, so on a healthy
+    # host it is a handful of sub-second requests. When the host is load-shedding —
+    # the exact condition that spawns these candidates in the first place — the same
+    # requests turn slow, so the loop is capped by an overall wall-clock budget;
+    # candidates not reached before the budget is spent are dropped unconfirmed. On a
+    # stressed host a length/status delta is noise rather than a real parameter, so
+    # erring toward suppression here keeps both the scan bounded and the report clean.
+    confirmed: list[dict] = []
+    if interesting:
+        confirm_deadline = asyncio.get_event_loop().time() + 20.0
+
+        async def _get_once(u: str) -> tuple[int, int, bool]:
+            async with session.get(u, timeout=aiohttp.ClientTimeout(total=6)) as rr:
+                bb = await rr.text()
+                return rr.status, len(bb), "HEAVEN_PROBE" in bb
+
+        for item in interesting:
+            if asyncio.get_event_loop().time() > confirm_deadline:
+                break
+            param = item["param"]
+            try:
+                c_name = "hvn_" + secrets.token_hex(4)
+                c_url = url + ("&" if "?" in url else "?") + f"{c_name}=HEAVEN_PROBE"
+                cc_status, cc_len, cc_refl = await _get_once(c_url)
+                p_url = url + ("&" if "?" in url else "?") + f"{param}=HEAVEN_PROBE"
+                p_status, p_len, p_refl = await _get_once(p_url)
+            except Exception:
+                logger.debug("suppressed non-fatal exception", exc_info=True)
+                continue
+            status_ok = (p_status != base_status and p_status != cc_status)
+            len_ok = (abs(p_len - base_len)
+                      > max(len_threshold, abs(cc_len - base_len) + jitter))
+            refl_ok = p_refl and not cc_refl
+            if status_ok or len_ok or refl_ok:
+                confirmed.append({
+                    "param": param,
+                    "status": p_status,
+                    "len_diff": abs(p_len - base_len),
+                    "reflected": refl_ok,
+                })
+
+    for item in confirmed:
         param = item["param"]
         # High-severity params
         high_risk = any(kw in param.lower() for kw in
@@ -943,9 +1043,12 @@ async def _fuzz_mail_header_injection(session: "aiohttp.ClientSession",
                     hdr_blob = "\n".join(f"{k}: {v}" for k, v in r.headers.items())
             except Exception:
                 return
-            # If our injected header/canary lands in the RESPONSE headers, the
-            # CRLF split was honoured — the mail routine will accept it too.
-            if canary in hdr_blob or "bcc:" in hdr_blob.lower():
+            # The CRLF split was honoured only when our UNIQUE canary lands in the
+            # response headers (whether as a Bcc value or a split-off header). A
+            # bare "bcc:" substring is NOT a valid oracle: a response header can
+            # carry it for unrelated reasons while the injection never worked, so
+            # keying off it alone fabricated a high-severity finding with no proof.
+            if canary in hdr_blob:
                 findings.append(_finding(
                     url, "smtp_header_injection", "high",
                     f"Mail (SMTP/IMAP) header injection via '{param}'",
@@ -1095,7 +1198,20 @@ async def _fuzz_method_override(session: "aiohttp.ClientSession",
                     # flagged method-override on every dynamic app — a medium FP on
                     # normal pages. A real override changes what the server DOES,
                     # which shows up as a different (non-error) status.
-                    if (r.status not in (404, 405, 501)
+                    #
+                    # "Accepted" also requires the override to have been PROCESSED,
+                    # not rejected: a denial on the override request (401/403, or any
+                    # 4xx/5xx) is the server REFUSING the header, the opposite of
+                    # honouring it, and a denial *baseline* (plain POST already
+                    # 401/403) means the endpoint flaps between auth states so a flip
+                    # to 200 is noise, not a bypass. The documented scenario is "POST
+                    # is allowed, DELETE/PUT is not" — plain POST is a success there —
+                    # so require BOTH the baseline and the override response to be
+                    # success/redirect (200-399) and to differ. This drops the
+                    # cPanel-port FPs where a plain POST 200 flipped to a 401 on the
+                    # override (and vice-versa) with no method actually honoured.
+                    if (200 <= base_status < 400
+                            and 200 <= r.status < 400
                             and r.status != base_status):
                         findings.append(_finding(
                             url, "method_override_accepted", "medium",
@@ -1187,7 +1303,8 @@ _FUZZ_STEALTH: dict[str, tuple[int, float]] = {
 
 
 async def fuzz_targets(urls: list[str], aggressive: Optional[bool] = None,
-                       max_urls: int = 40, stealth_level: str = "normal") -> dict:
+                       max_urls: int = 40, stealth_level: str = "normal",
+                       time_budget: Optional[float] = None) -> dict:
     """Fuzz multiple URLs concurrently.
 
     The verb-tampering / host-header / 403-bypass / cache-poisoning / smuggling /
@@ -1247,9 +1364,22 @@ async def fuzz_targets(urls: list[str], aggressive: Optional[bool] = None,
             if delay:
                 await asyncio.sleep(delay)
 
-    await asyncio.gather(*[_one(u) for u in unique], return_exceptions=True)
-    return {
+    # Budget-aware fan-out: URLs whose checks finished before the soft deadline
+    # keep their findings (appended to the shared list); the rest are cancelled
+    # rather than losing the whole task at the orchestrator's hard timeout.
+    from heaven.utils.fanout import gather_budgeted
+    _done, truncated = await gather_budgeted(
+        [_one(u) for u in unique], time_budget=time_budget)
+    out = {
         "total": len(all_findings),
         "findings": all_findings,
         "vulnerabilities": all_findings,
+        "urls_requested": len(unique),
+        "urls_audited": len(_done),
     }
+    if truncated:
+        out["budget_exhausted"] = True
+        logger.warning(
+            "Web fuzz: soft budget reached; audited %d of %d URL(s), "
+            "returning partial results", len(_done), len(unique))
+    return out

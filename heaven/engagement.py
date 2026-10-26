@@ -361,6 +361,15 @@ HOST_LEVEL_VULN_TYPES = frozenset({
     # server-wide config disclosure
     "dangerous_http_method", "directory_listing", "server_banner",
     "version_disclosure",
+    # password-policy fingerprint: a property of the site's registration, not of
+    # one URL. The auth probe builds its register URLs from absolute paths
+    # (urljoin(url, "/register" | "/signup" | ...)) and runs once per crawled URL,
+    # so on a catch-all / soft-404 host (every path answers 200) the identical
+    # observation lands on several register paths and used to persist as up to one
+    # copy per crawled URL. Dedup per host (not the matched register path) so it
+    # reports once. NOTE: the exact string only — ``cloud_iam_weak_password_policy``
+    # is a distinct per-account finding and is intentionally left untouched.
+    "weak_password_policy",
 })
 
 # Substring signals for host/domain-level posture findings. The exact vuln_type
@@ -830,6 +839,42 @@ _HEADER_BUNDLE_COVERAGE = {
 }
 
 
+# dns_recon emits a per-qualifier SPF finding (spf_soft_fail / spf_neutral /
+# spf_open_relay) while email_scanner emits one comprehensive ``spf_analysis``
+# that assesses the SAME published record. On a full scan both run, so one
+# domain's SPF ``all`` qualifier is reported twice under different vuln_types,
+# which identity-based dedup cannot merge (different vuln_type = different
+# identity by design). spf_analysis subsumes each per-qualifier case and is at
+# least as severe for every qualifier (critical for +all, high for ?all, and
+# email_scanner's deliberate low for the widely-accepted ~all), so the
+# per-qualifier copy is the redundant one.
+_SPF_QUALIFIER_TYPES = frozenset({"spf_soft_fail", "spf_neutral", "spf_open_relay"})
+
+
+def _consolidate_spf_family(findings: list) -> list:
+    """Drop dns_recon's per-qualifier SPF finding for a domain when
+    email_scanner's comprehensive ``spf_analysis`` is present for it.
+
+    Conservative by construction: the per-qualifier copy is removed only when
+    ``spf_analysis`` covers the SAME host, so a DNS-only scan (where
+    email_scanner never runs) keeps its SPF finding and loses no coverage."""
+    analysed_hosts = {
+        _host_key(str(f.get("target", "")))
+        for f in findings
+        if isinstance(f, dict) and str(f.get("vuln_type", "")) == "spf_analysis"
+    }
+    if not analysed_hosts:
+        return findings
+    out: list = []
+    for f in findings:
+        if (isinstance(f, dict)
+                and str(f.get("vuln_type", "")) in _SPF_QUALIFIER_TYPES
+                and _host_key(str(f.get("target", ""))) in analysed_hosts):
+            continue
+        out.append(f)
+    return out
+
+
 def _consolidate_header_family(findings: list) -> list:
     """Drop the misconfig header *bundle* / duplicate clickjacking for a host
     when auth_scanner's granular per-header findings already cover it.
@@ -909,7 +954,7 @@ def dedup_findings(findings: list) -> list:
         if is_host_level(vuln_type):
             best[key]["target"] = _host_key(target)
     deduped = [best[k] for k in order if k not in suppressed_keys]
-    return _consolidate_header_family(deduped)
+    return _consolidate_header_family(_consolidate_spf_family(deduped))
 
 
 # Human-readable phrasing for the suppressor's machine reason codes, so a lead's
@@ -1023,6 +1068,72 @@ CRITICALITY_MULTIPLIER = {
     "high":         1.3,
     "crown_jewel":  1.5,
 }
+
+
+def _scope_kind_of(target: str) -> str:
+    """Classify a scope entry into a scope-table ``kind``.
+
+    A ``*.example.com`` / ``.example.com`` entry is a subdomain-wide ``domain``;
+    a scheme'd entry is a ``url``; a dotted/slashed all-numeric entry is a
+    ``cidr``; an all-numeric dotted entry is an ``ip``; anything else is a bare
+    ``host``.
+    """
+    t = (target or "").strip().lower()
+    if t.startswith("*.") or t.startswith("."):
+        return "domain"
+    if t.startswith("http://") or t.startswith("https://"):
+        return "url"
+    body = t.replace(".", "").replace("/", "")
+    if "/" in t and body.isdigit():
+        return "cidr"
+    if t and all(c.isdigit() or c == "." for c in t):
+        return "ip"
+    return "host"
+
+
+def _iter_program_json(parsed: object):
+    """Yield ``(target, in_scope)`` pairs from a parsed program-scope JSON.
+
+    Accepts the common HackerOne / Bugcrowd shapes and simple
+    ``{"in_scope": [...], "out_of_scope": [...]}`` objects. Unknown shapes
+    yield nothing rather than raising, so a malformed export degrades to "no
+    entries imported" instead of a traceback.
+    """
+    def _asset_id(d: dict) -> str:
+        for key in ("asset_identifier", "target", "name", "host", "url",
+                    "identifier", "value"):
+            v = d.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    def _is_in(d: dict) -> bool:
+        for key in ("eligible_for_submission", "in_scope", "inScope",
+                    "eligible"):
+            if key in d:
+                return bool(d[key])
+        return True  # default: present means in-scope unless marked otherwise
+
+    if isinstance(parsed, dict):
+        # Wrapper keys that hold the actual list(s).
+        for wrap in ("scopes", "targets", "assets", "data"):
+            if isinstance(parsed.get(wrap), (list, dict)):
+                yield from _iter_program_json(parsed[wrap])
+        for key, in_scope in (("in_scope", True), ("inScope", True),
+                              ("out_of_scope", False), ("outOfScope", False),
+                              ("excluded", False)):
+            for item in parsed.get(key, []) or []:
+                if isinstance(item, str):
+                    yield item, in_scope
+                elif isinstance(item, dict):
+                    yield _asset_id(item), _is_in(item)
+        return
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, str):
+                yield item, True
+            elif isinstance(item, dict):
+                yield _asset_id(item), _is_in(item)
 
 
 @dataclass
@@ -1418,12 +1529,15 @@ class EngagementStore:
     def is_in_scope(self, target: str) -> bool:
         """Check if a target is explicitly authorized in this engagement.
 
-        Matches exactly first (covers URLs / hostnames / an exact IP or CIDR
-        entry). Then, for an IP or CIDR target, also authorizes it when it falls
-        *inside* an in-scope CIDR — so adding ``192.168.1.0/24`` to scope covers
-        every host in it, and a bare IP within a scoped range passes. This only
-        ever authorizes a target contained by an authorized range; it never
-        widens scope to something broader than what was authorized."""
+        Matches exactly first (an identical URL / hostname / IP / CIDR entry),
+        then by host, so a scope entry and a target that name the same host match
+        across forms (``www.example.com`` in scope authorizes
+        ``https://www.example.com`` and ``www.example.com:443``, and a scoped URL
+        authorizes its bare host). Host matching is exact and never widens scope:
+        a scoped ``example.com`` does not authorize ``sub.example.com``. Finally,
+        an IP or CIDR target is authorized when it falls *inside* an in-scope CIDR
+        — so adding ``192.168.1.0/24`` covers every host in it — but never when it
+        is broader than what was authorized."""
         import ipaddress
         from urllib.parse import urlparse
 
@@ -1434,25 +1548,45 @@ class EngagementStore:
             if row is not None:
                 return bool(row["in_scope"])
 
-            # Range containment: derive an IP/CIDR from the target (a bare IP or
-            # CIDR, or the host of a URL). A non-IP hostname can't be
-            # range-matched, so it's out of scope unless matched exactly above.
+            # Host match, then range containment. A target is authorized when it
+            # names the SAME host as a scope entry — so adding `www.example.com`
+            # authorizes `https://www.example.com`, `www.example.com:443` and
+            # `www.example.com/path`, and a scoped URL authorizes its bare host —
+            # or when it is an IP/CIDR contained by an in-scope range. Host
+            # matching is EXACT: a scoped `example.com` never pulls in
+            # `sub.example.com`, so scope is matched here, never widened (the
+            # orchestrator's ScopeGuard governs hosts discovered mid-scan).
+            def _host_key(s: str) -> str:
+                s = (s or "").strip().lower()
+                if not s:
+                    return ""
+                try:
+                    return urlparse(s if "://" in s else "//" + s).hostname or ""
+                except ValueError:
+                    return ""
+
+            t_host = _host_key(target)
             probe = target
             if "://" in probe:
                 probe = urlparse(probe).hostname or ""
             try:
                 t_net = ipaddress.ip_network(probe, strict=False)
             except ValueError:
-                return False
+                t_net = None
 
             for r in c.execute(
                 "SELECT target FROM scope WHERE in_scope = 1"
             ).fetchall():
                 cand = r["target"]
-                if "://" in cand:
-                    cand = urlparse(cand).hostname or ""
+                if t_host and _host_key(cand) == t_host:
+                    return True
+                if t_net is None:
+                    continue
+                cand_net = cand
+                if "://" in cand_net:
+                    cand_net = urlparse(cand_net).hostname or ""
                 try:
-                    c_net = ipaddress.ip_network(cand, strict=False)
+                    c_net = ipaddress.ip_network(cand_net, strict=False)
                 except ValueError:
                     continue
                 try:
@@ -1499,18 +1633,76 @@ class EngagementStore:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Crude kind detection
-            if line.startswith("http://") or line.startswith("https://"):
-                kind = "url"
-            elif "/" in line and line.replace(".", "").replace("/", "").isdigit():
-                kind = "cidr"
-            elif all(c.isdigit() or c == "." for c in line):
-                kind = "ip"
-            else:
-                kind = "host"
-            self.add_scope(line, kind=kind)
+            self.add_scope(line, kind=_scope_kind_of(line))
             count += 1
         return count
+
+    def import_program_scope(self, path: Path | str) -> dict[str, int]:
+        """Import a bug-bounty program's scope, in-scope AND out-of-scope.
+
+        Unlike :meth:`import_scope_file` (every line is in-scope), this
+        understands the shapes programs actually publish, so a HackerOne /
+        Bugcrowd scope can be loaded directly:
+
+        * **JSON** — a list of asset dicts (``asset_identifier`` /
+          ``eligible_for_submission`` as HackerOne emits, or ``target`` /
+          ``in_scope`` as Bugcrowd does), or an object with ``in_scope`` /
+          ``out_of_scope`` string lists, or one wrapping either under
+          ``scopes`` / ``targets``.
+        * **Text** — one target per line. A line beginning with ``!`` is
+          out-of-scope; a comment line naming "out of scope" / "excluded"
+          switches the following lines to out-of-scope (and "in scope" back).
+          A ``*.example.com`` / ``.example.com`` entry is stored as a ``domain``
+          (subdomain-wide) so recon and ScopeGuard treat it as a wildcard.
+
+        Returns ``{"in_scope": n, "out_of_scope": m}``. Nothing here authorises
+        a host; it only records what the program published.
+        """
+        import json
+
+        path = Path(path)
+        raw = path.read_text()
+        added = {"in_scope": 0, "out_of_scope": 0}
+
+        def _record(target: str, in_scope: bool) -> None:
+            target = (target or "").strip()
+            if not target:
+                return
+            self.add_scope(target, kind=_scope_kind_of(target), in_scope=in_scope)
+            added["in_scope" if in_scope else "out_of_scope"] += 1
+
+        stripped = raw.lstrip()
+        is_json = path.suffix.lower() == ".json" or stripped[:1] in ("{", "[")
+        parsed = None
+        if is_json:
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None  # fall through to text parsing
+
+        if parsed is not None:
+            for target, in_scope in _iter_program_json(parsed):
+                _record(target, in_scope)
+            return added
+
+        # Text form, with section markers and the ``!`` out-of-scope prefix.
+        current_in = True
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                low = line.lower()
+                if "out of scope" in low or "out-of-scope" in low or "excluded" in low:
+                    current_in = False
+                elif "in scope" in low or "in-scope" in low:
+                    current_in = True
+                continue
+            if line.startswith("!"):
+                _record(line[1:].strip(), in_scope=False)
+            else:
+                _record(line, in_scope=current_in)
+        return added
 
     # ── Scans ──────────────────────────────────────────────────────────
     def record_scan_start(self, scan_id: str, name: str = "", mode: str = "",
@@ -1871,27 +2063,46 @@ class EngagementStore:
                 prob, audit = calibrated_confidence({**finding, "evidence": evidence})
                 evidence["calibrated_confidence"] = prob
                 evidence["calibration"] = audit
+            # Persist the AUTHORITATIVE severity AND a CVSS base consistent with
+            # it, both resolved in ONE reconciliation pass. The band is reconciled
+            # against the finding's real CVSS base (a published CVE score drives
+            # the label; an unconfirmed indicator is capped to its low band).
+            # Storing the reconciled band is what keeps the findings list,
+            # dashboard tally, severity filter/sort and the detail/report in
+            # agreement — they used to disagree because only the detail/report
+            # reconciled on read (an LFI at CVSS 8.1 showed as Critical in the list
+            # but High on its detail page). Crucially, we also persist the
+            # reconciled cvss_base: storing only the capped LABEL while leaving the
+            # raw, higher base in evidence made the export surfaces drift — a
+            # finding capped to Low still carried its class base of 7.5, so a SARIF
+            # export's security-severity read 7.5 (GitHub code-scanning buckets
+            # that as High) while HEAVEN's own badge said Low. The KB is optional,
+            # so a failure here must never block persisting a finding: fall back to
+            # the raw label/base.
+            severity = finding.get("severity", "info")
+            scored_finding = finding
+            with suppress(Exception):
+                from heaven.devsecops.vuln_kb import canonical_finding
+                reconciled = canonical_finding({**finding, "evidence": evidence})
+                canon = str(reconciled.get("severity") or "").strip().lower()
+                if canon:
+                    severity = canon
+                rb = (reconciled.get("evidence") or {}).get("cvss_base")
+                if rb is None:
+                    rb = reconciled.get("cvss_base")
+                if isinstance(rb, (int, float)) and 0.0 < float(rb) <= 10.0:
+                    evidence["cvss_base"] = round(float(rb), 1)
+                # Score the risk column off the reconciled finding too, so the
+                # dashboard's per-finding risk matches the badge instead of the
+                # pre-cap base.
+                scored_finding = reconciled
+
             evidence_json = json.dumps(evidence)
-            risk_score = _risk_value(finding)
+            risk_score = _risk_value(scored_finding)
             confidence = float(finding.get("confidence", 0.0) or 0.0)
             confidence_bucket = (
                 finding.get("confidence_bucket") or _confidence_bucket(confidence)
             )
-            # Persist the AUTHORITATIVE severity, not the raw detector label: the
-            # band reconciled against the finding's real CVSS base (a published CVE
-            # score drives the label; an unconfirmed indicator is capped to its low
-            # band). Storing the reconciled band is what keeps the findings list,
-            # dashboard tally, severity filter/sort and the detail/report in
-            # agreement — they used to disagree because only the detail/report
-            # reconciled on read (an LFI at CVSS 8.1 showed as Critical in the list
-            # but High on its detail page). The KB is optional, so a failure here
-            # must never block persisting a finding: fall back to the raw label.
-            severity = finding.get("severity", "info")
-            with suppress(Exception):
-                from heaven.devsecops.vuln_kb import canonical_severity
-                canon = canonical_severity({**finding, "evidence": evidence})
-                if canon:
-                    severity = canon
 
             if existing:
                 # Dedup — refresh last_seen_at + seen_count + the (re-computed) risk

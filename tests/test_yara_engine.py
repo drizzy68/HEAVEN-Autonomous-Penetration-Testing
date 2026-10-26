@@ -41,13 +41,23 @@ def test_wso2_vendor_string_not_flagged():
 
 def test_binary_media_bytes_have_no_webshell_fp():
     # Plausible bytes inside a real media container: a brand token embedded in
-    # binary noise, but no PHP/JSP code anywhere. Must not fire the named rule.
-    import os
+    # binary noise, but no PHP code anywhere. Must not fire the named rule.
+    #
+    # The randomness is SEEDED so this is reproducible: an unseeded draw would
+    # flake, because the old context gate accepted the two-byte ASP tag "<%",
+    # which turns up in ~0.4% of short random byte runs and paired with the
+    # inserted brand token to fire a bogus critical. The gate is now PHP-only,
+    # so brand token + binary noise must never fire. We assert that over many
+    # deterministic draws, not just one, to actually exercise the floor.
+    import random
+    rng = random.Random(0xA11CE)
     for token in (b"FilesMan", b"WSO 2", b"b374k", b"IndoXploit", b"alfa team"):
-        blob = os.urandom(64) + b"\x00moov" + token + b"\x00\xff" + os.urandom(64)
-        crit = [m for m in Y.scan_bytes(blob)
-                if m.severity in ("critical", "high")]
-        assert crit == [], (token, crit)
+        for _ in range(400):
+            blob = (rng.randbytes(64) + b"\x00moov" + token
+                    + b"\x00\xff" + rng.randbytes(64))
+            crit = [m for m in Y.scan_bytes(blob)
+                    if m.severity in ("critical", "high")]
+            assert crit == [], (token, crit)
 
 
 def test_named_webshell_in_polyglot_still_detected():
@@ -78,6 +88,30 @@ def test_china_chopper_detected():
 def test_jsp_webshell_detected():
     body = ('<% Runtime.getRuntime().exec(request.getParameter("c")); %>')
     assert "JSP_Webshell" in _rules(Y.scan_bytes(body))
+
+
+def test_aspx_webshell_detected():
+    # A genuine ASPX shell: a process launch fed from a request value.
+    body = ('<%@ Page Language="C#" %><% System.Diagnostics.Process.Start('
+            '"cmd.exe", "/c " + Request["cmd"]); %>')
+    assert "ASPX_Webshell" in _rules(Y.scan_bytes(body))
+    # eval-from-request is also caught.
+    body2 = '<% eval(Request.QueryString["x"]); %>'
+    assert "ASPX_Webshell" in _rules(Y.scan_bytes(body2))
+
+
+def test_legit_process_start_is_not_a_webshell():
+    # System.Diagnostics.Process.Start is a ubiquitous legitimate .NET API; its
+    # presence WITHOUT a request-value source must not raise a critical webshell.
+    for body in (
+        'var p = System.Diagnostics.Process.Start("notepad.exe");',
+        'Process.Start(new ProcessStartInfo { FileName = "backup.sh" });'
+        ' System.Diagnostics.Process.Start("backup.sh");',
+        '<% System.Diagnostics.Process.Start("report-generator.exe"); %>',
+    ):
+        hits = [m for m in Y.scan_bytes(body)
+                if m.severity in ("critical", "high")]
+        assert hits == [], (body, hits)
 
 
 def test_benign_content_has_no_critical_match():

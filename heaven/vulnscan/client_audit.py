@@ -28,6 +28,7 @@ from __future__ import annotations
 from heaven.net.egress import client_session as _egress_cs  # egress-routed aiohttp
 
 import re
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -36,6 +37,7 @@ try:
 except ImportError:  # pragma: no cover
     HAS_AIOHTTP = False
 
+from heaven.utils.domains import same_site as _same_site
 from heaven.utils.logger import get_logger
 
 logger = get_logger("vulnscan.client_audit")
@@ -71,7 +73,7 @@ _SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("slack_token", re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,}")),
     ("bearer_token", re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}")),
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_\-]{5,}\.eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}")),
-    ("password_assignment", re.compile(r"(?i)(?:password|passwd|pwd|secret|api[_\-]?key)\s*[:=]\s*['\"][^'\"\s]{4,}['\"]")),
+    ("password_assignment", re.compile(r"(?i)(?:password|passwd|pwd|secret|api[_\-]?key)\s*[:=]\s*['\"]([^'\"\s]{4,})['\"]")),
     ("basic_auth_url", re.compile(r"(?i)https?://[^\s:@/]+:[^\s:@/]+@")),
     ("private_ip", re.compile(r"\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b")),
 )
@@ -82,6 +84,40 @@ _DEV_NOTE_RE = re.compile(
     r"(?:password|secret|token|key|admin|auth|creds?|credential|disable|bypass|hardcod)"
 )
 
+# The password_assignment pattern is the one value-bearing match loose enough to
+# fire on a commented-out config *example*, so its captured value is screened
+# here before it can raise a high-severity disclosure. A placeholder is template
+# text, not a live credential: a format/template delimiter, a "YOUR_..." stub, a
+# fill run (xxxx / **** / ...), or an obvious placeholder word. Real weak defaults
+# ("admin", "changeme", "password") are NOT placeholders and still fire, matching
+# the example/dummy screening the git_secrets scanner already applies.
+_PLACEHOLDER_WORDS = (
+    "example", "placeholder", "redacted", "insert", "sample", "changethis",
+    "yourkey", "apikeyhere", "todo",
+)
+_FILL_VALUE_RE = re.compile(r"(?:[xX]{4,}|\*{4,}|\.{3,})")
+
+
+def _is_placeholder_value(val: str) -> bool:
+    """True when a captured secret value is an obvious template placeholder
+    rather than a live credential."""
+    v = val.strip()
+    low = v.lower()
+    # Template interpolation / angle-bracket stubs: ${SECRET}, {{token}},
+    # %(password)s, <your-password>. A bare '$' or '<' is NOT a signal, since real
+    # values carry them (leetspeak P@$$w0rd, a bcrypt "$2a$..." hash).
+    if "${" in v or "{{" in v or "}}" in v:
+        return True
+    if "<" in v and ">" in v:
+        return True
+    if "%s" in low or "%d" in low or "%(" in low:   # printf / %(name)s templates
+        return True
+    if _FILL_VALUE_RE.fullmatch(v):           # xxxx, ****, ...
+        return True
+    if low.startswith("your"):                # YOUR_API_KEY, your-token
+        return True
+    return any(w in low for w in _PLACEHOLDER_WORDS)
+
 
 def _review_source(target: str, html: str) -> list[dict]:
     out: list[dict] = []
@@ -90,6 +126,17 @@ def _review_source(target: str, html: str) -> list[dict]:
     for m in _HTML_COMMENT_RE.finditer(html):
         body = m.group(1)
         for label, pat in _SECRET_PATTERNS:
+            if label == "password_assignment":
+                # Screen the captured value: a templated example in a comment is
+                # not a leaked credential. Scan all matches so a real secret that
+                # sits next to a placeholder in the same comment is still caught.
+                for sm in pat.finditer(body):
+                    if _is_placeholder_value(sm.group(1)):
+                        continue
+                    hits.append({"where": "html_comment", "kind": label,
+                                 "snippet": body.strip()[:160]})
+                    break
+                continue
             sm = pat.search(body)
             if sm:
                 hits.append({"where": "html_comment", "kind": label,
@@ -130,10 +177,16 @@ _EXEC_SINKS = (
     r"\$\(\s*[^)]*\)\.append", r"\.setAttribute\s*\(\s*['\"]on",
 )
 _EXEC_SINK_RE = re.compile("|".join(_EXEC_SINKS))
-# Resource-loading sinks (client-side resource manipulation).
+# Resource-loading sinks (client-side resource manipulation). The bare-"="
+# assignment sinks carry a negative-lookahead (?!=) so an equality or strict
+# equality COMPARISON (location.href === a.href, el.src == want) is not mistaken
+# for an assignment into the sink: without it, the "=" in "===" matched, and
+# read-only nav-highlight code — `if (document.location.href === a.href)` — was
+# reported as client-side resource manipulation. A single "=" (a real
+# assignment) still matches, so no true positive is lost.
 _RES_SINKS = (
-    r"\.src\s*=", r"\.setAttribute\s*\(\s*['\"]src['\"]", r"\.href\s*=",
-    r"\.action\s*=", r"importScripts\s*\(", r"\.setAttribute\s*\(\s*['\"]href['\"]",
+    r"\.src\s*=(?!=)", r"\.setAttribute\s*\(\s*['\"]src['\"]", r"\.href\s*=(?!=)",
+    r"\.action\s*=(?!=)", r"importScripts\s*\(", r"\.setAttribute\s*\(\s*['\"]href['\"]",
 )
 _RES_SINK_RE = re.compile("|".join(_RES_SINKS))
 _PROXIMITY = 200   # chars between a source and a sink to count as a flow
@@ -252,6 +305,19 @@ def _check_flash(target: str, html: str) -> list[dict]:
 async def _fetch(session: "aiohttp.ClientSession", url: str) -> tuple[str, str]:
     try:
         async with session.get(url, allow_redirects=True) as resp:
+            # Off-site-redirect guard: the content read here is attributed to the
+            # requested URL, but allow_redirects follows 30x hops. If the target
+            # bounced off its registered domain (to a CDN / SSO / parking host),
+            # the delivered HTML/JS belongs to THAT origin, so attributing a
+            # leaked secret or a DOM-XSS sink to the in-scope target would be a
+            # wrong-target false positive. Same guard the header/cookie audits
+            # use. A fake/odd response with no .url falls back to the requested
+            # URL (treated same-site).
+            final_url = str(getattr(resp, "url", "") or url)
+            if not _same_site(url, final_url):
+                logger.debug("client_audit: %s redirected off-site to %s: skipping",
+                             url, final_url)
+                return "", ""
             ctype = resp.headers.get("Content-Type", "")
             if resp.status >= 400:
                 return "", ctype
@@ -303,12 +369,15 @@ def _dedup(findings: list[dict]) -> list[dict]:
 
 
 async def scan_client_audit(urls: list[str], timeout: float = _DEFAULT_TIMEOUT,
-                            max_urls: int = 40, **_kw) -> dict:
+                            max_urls: int = 40,
+                            time_budget: Optional[float] = None, **_kw) -> dict:
     """Static client-side audit over a set of URLs."""
     if not HAS_AIOHTTP:
         return {"findings": [], "vulnerabilities": [], "total": 0,
                 "error": "aiohttp not installed"}
     import asyncio
+
+    from heaven.utils.fanout import gather_budgeted
 
     seen: set[str] = set()
     unique: list[str] = []
@@ -332,8 +401,23 @@ async def scan_client_audit(urls: list[str], timeout: float = _DEFAULT_TIMEOUT,
             async with sem:
                 findings.extend(await audit_url(session, u))
 
-        await asyncio.gather(*[_one(u) for u in unique], return_exceptions=True)
+        # Budget-aware: each _one appends to the shared `findings` as it finishes,
+        # so URLs completed before the soft deadline are kept; the ones still
+        # pending at the deadline are cancelled (they never appended). This stops
+        # the orchestrator's hard timeout from cancelling the whole task and
+        # dropping every finding.
+        _results, truncated = await gather_budgeted(
+            [_one(u) for u in unique], time_budget=time_budget)
 
     findings = _dedup(findings)
+    audited = len(_results)
     logger.info("Client-side audit → %d finding(s) across %d URL(s)", len(findings), len(unique))
-    return {"findings": findings, "vulnerabilities": findings, "total": len(findings)}
+    out: dict = {"findings": findings, "vulnerabilities": findings,
+                 "total": len(findings),
+                 "urls_requested": len(unique), "urls_audited": audited}
+    if truncated:
+        out["budget_exhausted"] = True
+        logger.warning(
+            "Client-side audit: soft budget reached; audited %d of %d URL(s), "
+            "returning partial results", audited, len(unique))
+    return out

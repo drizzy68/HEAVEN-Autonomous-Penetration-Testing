@@ -7,6 +7,7 @@ concurrency control, and real-time progress reporting.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,89 @@ logger = get_logger("orchestrator")
 # deadline at 90% of this so it returns partial findings before the hard cancel
 # (see _injection_scan / scan_for_injections time_budget).
 _INJECTION_TIMEOUT_S = 600
+
+# The running task's effective (scope/stealth-scaled) timeout, published per
+# task so a fan-out scanner can soft-cap itself well below the orchestrator's
+# hard cancel and RETURN partial findings instead of losing them all (the
+# orchestrator harvests findings only from COMPLETED tasks). `_run_task` sets it
+# inside each task's own contextvars context — which asyncio.wait_for copies into
+# the scanner coroutine — so it never leaks between concurrently running tasks.
+_CURRENT_EFF_TIMEOUT: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "heaven_task_eff_timeout", default=None)
+
+
+def current_task_budget(frac: float = 0.9) -> Optional[float]:
+    """Soft fan-out deadline for the running task: ``frac`` of its effective
+    timeout, leaving a drain margin before the hard cancel. ``None`` when no task
+    context is active (e.g. a scanner called directly in a test), which the
+    fan-out helpers treat as "unbounded"."""
+    eff = _CURRENT_EFF_TIMEOUT.get()
+    return (eff * frac) if eff else None
+
+
+def _build_coverage_notes(results: "dict[str, TaskResult]",
+                          *, cancelled: bool = False) -> list[dict]:
+    """Honest coverage caveats from the task results of a finished scan.
+
+    Two silent-miss cases, both rendered by the CLI and the report:
+      * a fan-out scanner that COMPLETED but hit its soft time budget — it
+        salvaged the findings it gathered in time, yet its coverage is PARTIAL
+        (it signals this with ``budget_exhausted`` + ``urls_audited`` /
+        ``urls_requested`` in its result data);
+      * a task that FAILED or timed out — it contributed ZERO findings, so its
+        whole surface is absent from the report.
+
+    When the operator cancelled the scan, the per-task failure notes are skipped
+    (a scan-wide stop makes partial coverage obvious and would otherwise flood
+    the report with a note per unfinished task); budget-salvage notes are still
+    emitted because those tasks did complete with real partial results.
+    """
+    notes: list[dict] = []
+    for res in results.values():
+        data = res.data if isinstance(getattr(res, "data", None), dict) else {}
+        if res.state == TaskState.COMPLETED and data.get("budget_exhausted"):
+            aud = data.get("urls_audited")
+            req = data.get("urls_requested")
+            scope = (f"{aud} of {req}" if (aud is not None and req) else "part of the")
+            notes.append({
+                "type": "scanner_time_budget",
+                "scanner": res.name,
+                "urls_audited": aud,
+                "urls_requested": req,
+                "impact": (
+                    f"{res.name} reached its time budget after auditing {scope} "
+                    "target(s); the remaining targets were not scanned. The findings "
+                    "it did return are complete and accurate, but this scanner's "
+                    "coverage is PARTIAL on this host"),
+                "remediation": (
+                    "re-run with a longer per-task timeout (a wider scope / "
+                    "aggressive mode already scales it up), or lower the stealth "
+                    "level so the host answers faster, to cover the rest"),
+            })
+            continue
+        # Only a FAILED task (a timeout is recorded as FAILED, see _run_task) is a
+        # miss. SKIPPED is intentional (mode/scope/dependency); CANCELLED only on a
+        # scan-wide stop.
+        if cancelled or res.state != TaskState.FAILED:
+            continue
+        err = str(getattr(res, "error", "") or "").strip()
+        reason = "timed out" if ("timeout" in err.lower() or "timed out" in err.lower()) \
+            else "failed"
+        notes.append({
+            "type": "scanner_incomplete",
+            "scanner": res.name,
+            "state": res.state.value,
+            "error": err or None,
+            "impact": (
+                f"{res.name} {reason} and contributed no findings; its coverage is "
+                "MISSING from this report. A clean result here means the scanner did "
+                "not run to completion, not that the target is clean"
+                + (f" ({err})" if err else "")),
+            "remediation": (
+                "re-run the scan (optionally with a longer timeout or lower stealth "
+                f"level) so {res.name} completes and its surface is covered"),
+        })
+    return notes
 
 
 def _scan_domains(targets: dict) -> list[str]:
@@ -294,6 +378,18 @@ class ScanOrchestrator:
         # Initialised lazily from build_full_scan (needs the targets dict).
         self.feedback: Optional[FeedbackEngine] = None
         self._followup_hosts: set[str] = set()  # hosts already given a follow-on task
+        # Shared out-of-band (OAST) collaborator for the whole run. The OOB
+        # SSRF/XXE/cmdi task and the injection task's DNS-exfil blind-SQLi probe
+        # use the SAME listener, so there is a single DNS bind (two separate
+        # listeners would collide on the DNS port and one would silently degrade
+        # to HTTP-only). Started lazily on first use — building an orchestrator
+        # must bind no socket, since the test suite builds many — and stopped in
+        # run()'s teardown. The bug-bounty routable profile is what makes the
+        # operator export HEAVEN_OAST_DNS_ZONE / HEAVEN_OAST_PUBLIC_IP, which
+        # from_env() reads to activate the DNS channel.
+        self._oast = None
+        self._oast_lock = asyncio.Lock()
+        self._oast_started = False
         # Web/vuln task timeouts scale up for slower / quieter / wider scans, so a
         # rate-limiting real-world host does not trip the old fixed caps mid-scan
         # and lose the task's partial work. Set from stealth + scope in
@@ -340,6 +436,40 @@ class ScanOrchestrator:
             "default": asyncio.Semaphore(200),
             "ml": asyncio.Semaphore(10),
         }
+
+    async def get_oast(self):
+        """Lazily start and return the run's shared OAST collaborator.
+
+        Returns ``None`` when a collaborator cannot be started (no socket). The
+        DNS channel activates only when ``HEAVEN_OAST_DNS_ZONE`` is set; the
+        listener binds loopback by default, which already covers localhost/lab
+        targets. Safe to call from several tasks concurrently — the first caller
+        starts the listener under the lock, the rest get the same instance.
+        """
+        async with self._oast_lock:
+            if self._oast_started:
+                return self._oast
+            self._oast_started = True
+            try:
+                from heaven.vulnscan.oast import OASTListener
+                self._oast = OASTListener.from_env().start()
+                if getattr(self._oast, "dns_enabled", False):
+                    logger.info(
+                        "OAST DNS channel active (zone %s) — blind DNS-exfil "
+                        "SSRF/RCE/SQLi provable", self._oast.dns_zone)
+            except OSError as e:
+                logger.debug("shared OAST collaborator unavailable (%s)", e)
+                self._oast = None
+            return self._oast
+
+    def _stop_oast(self) -> None:
+        """Stop the shared collaborator if it was started (run() teardown)."""
+        if self._oast is not None:
+            try:
+                self._oast.stop()
+            except Exception:  # noqa: BLE001 — teardown must never fail a scan
+                logger.debug("suppressed OAST stop error", exc_info=True)
+            self._oast = None
 
     def add_task(
         self,
@@ -487,6 +617,12 @@ class ScanOrchestrator:
             # Effective (scope/stealth-scaled) deadline — the same value the phase
             # ceiling uses, so a scaled task never outruns its phase.
             eff_timeout = self._effective_timeout(task)
+            # Publish this task's effective deadline so a fan-out scanner can
+            # soft-cap itself (current_task_budget) and return partial findings
+            # before the hard wait_for cancel below. Set inside this task's own
+            # context (each task is its own ensure_future), so it never bleeds
+            # into a concurrently running task.
+            _CURRENT_EFF_TIMEOUT.set(eff_timeout)
             # Register as in-flight so it earns time-based partial progress, and
             # push an immediate update so the bar reacts the moment work starts.
             self.progress.running[task.id] = (start, eff_timeout)
@@ -1356,6 +1492,11 @@ class ScanOrchestrator:
         elapsed = self.progress.elapsed_seconds
 
         all_vulns, all_assets, all_dns = [], [], []
+        # Honest coverage notes (e.g. a SPA crawled without a headless browser, so
+        # DOM-rendered routes may be under-reported). The crawler emits these but
+        # nothing used to consume them, so the operator never learned coverage was
+        # reduced — a silent under-report on JS-heavy apps. Surface them here.
+        all_coverage_notes: list[dict] = []
         sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
         # CVE id -> {in_kev, epss} from the NVD CPE catalog sweep (Vulnerability
         # Mapping task). Threat-intel enrichment we cross-reference onto the real
@@ -1381,6 +1522,7 @@ class ScanOrchestrator:
             # the summary so the Assets view and the report's DNS section render
             # the attack surface's naming layer, not just host/port inventory.
             all_dns.extend(data.get("dns_records", []))
+            all_coverage_notes.extend(data.get("coverage_notes", []))
             for cve in data.get("nvd_cve_catalog", []):
                 cid = str(cve.get("cve_id") or "").upper()
                 if cid:
@@ -1438,10 +1580,51 @@ class ScanOrchestrator:
                     f["in_kev"] = True
                 if ti["epss"] and not f.get("epss") and not f.get("epss_score"):
                     f["epss_score"] = ti["epss"]
+        # Reconcile each finding to the authoritative, CVSS-aligned severity band
+        # AND a CVSS base consistent with it — the SAME reconciliation
+        # upsert_finding persists and the findings list / report render. Without
+        # this the JSON summary and the live tally kept the raw detector label, so
+        # a weak-signal finding could read High in the scan JSON yet Medium
+        # everywhere that loads the engagement DB (an SSH weak-host-key finding:
+        # High in -o json, Medium in the saved report). The base matters too:
+        # anything built straight off this summary (the report JSON, the aggregator
+        # SARIF/HTML) reads cvss_base via objective_base_score, so a finding capped
+        # to Low that kept its raw 7.5 base would show "Low" badge next to a 7.5
+        # CVSS column (and a 7.5 security-severity GitHub buckets as High). Mutate
+        # both here so the summary is self-consistent. The KB is optional, so a
+        # failure must never block a scan — keep the raw label/base.
+        try:
+            from heaven.devsecops.vuln_kb import canonical_finding
+        except Exception:  # noqa: BLE001 — KB optional
+            canonical_finding = None  # type: ignore[assignment]
         for f in all_vulns:
+            if canonical_finding is not None:
+                try:
+                    canon = canonical_finding(f)
+                    canon_sev = str(canon.get("severity") or "").strip().lower()
+                    if canon_sev:
+                        f["severity"] = canon_sev
+                    rb = (canon.get("evidence") or {}).get("cvss_base")
+                    if rb is None:
+                        rb = canon.get("cvss_base")
+                    if isinstance(rb, (int, float)) and 0.0 < float(rb) <= 10.0:
+                        ev = f.get("evidence")
+                        if not isinstance(ev, dict):
+                            ev = {}
+                            f["evidence"] = ev
+                        ev["cvss_base"] = round(float(rb), 1)
+                except Exception:  # noqa: BLE001 — never block on one finding
+                    logger.debug("canonical reconciliation failed for a finding", exc_info=True)
             sev = (f.get("severity") or "info").lower()
             if sev in sev_counts:
                 sev_counts[sev] += 1
+
+        # Disclose where coverage was partial or missing: a scanner that hit its
+        # soft budget (COMPLETED with partial findings) or that failed / timed out
+        # (ZERO findings — the harvest loop above skips non-COMPLETED tasks). Both
+        # are the "silent miss" this effort exists to prevent.
+        all_coverage_notes.extend(
+            _build_coverage_notes(self.results, cancelled=self._cancelled))
 
         summary = {
             "scan_id": self.scan_id,
@@ -1455,6 +1638,7 @@ class ScanOrchestrator:
             "leads": all_leads,
             "assets": all_assets,
             "dns_records": all_dns,
+            "coverage_notes": all_coverage_notes,
             **sev_counts,
             "results": {r.task_id: r.state.value for r in all_results},
         }
@@ -1480,6 +1664,9 @@ class ScanOrchestrator:
             record_findings_to_knowledge(all_vulns, all_assets, engagement_name=eng_name)
         except Exception:  # noqa: BLE001
             logger.debug("knowledge-graph capture skipped", exc_info=True)
+
+        # Release the shared OAST collaborator (HTTP + any DNS listener/thread).
+        self._stop_oast()
 
         return summary
 
@@ -1755,7 +1942,8 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                     mine_urls.append(ep_url)
         if not mine_urls:
             return {"skipped": True, "reason": "no URLs for parameter mining"}
-        return await mine_parameters(mine_urls, stealth_level=stealth)
+        return await mine_parameters(mine_urls, stealth_level=stealth,
+                                     time_budget=current_task_budget())
 
     orch.add_task(
         "Parameter Mining (hidden inputs)", _param_mine,
@@ -1957,9 +2145,22 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
             # subdomains (many on third-party infra). Scope discipline mirrors
             # ScopeGuard exactly (see feedback.ScopeGuard.allows_subdomains).
             scope = orch.feedback.scope if orch.feedback else None
+            # Soft budget so a wide target list (many URLs each doing subdomain
+            # enum + cert + vhost + JS-secret + endpoint-fuzz) returns the recon
+            # gathered so far instead of being cancelled at the hard timeout with
+            # nothing (this task feeds endpoints to every downstream web scanner).
+            _budget = current_task_budget()
+            _deadline = (time.monotonic() + _budget) if _budget else None
             async with _egress_cs(
                             timeout=aiohttp.ClientTimeout(total=25, connect=10)) as session:
                 for url in targets.get("urls", []):
+                    if _deadline is not None and time.monotonic() >= _deadline:
+                        results["budget_exhausted"] = True
+                        logger.warning(
+                            "deep recon: soft budget reached; returning partial "
+                            "recon (%d subdomain(s), %d endpoint(s))",
+                            len(results["subdomains"]), len(results["endpoints"]))
+                        break
                     from urllib.parse import urlparse
                     parsed = urlparse(url)
                     domain = parsed.hostname or ""
@@ -2446,7 +2647,11 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                             urls.append(u)
         except Exception as e:  # noqa: BLE001 — enrichment is optional
             logger.debug(f"nuclei URL enrichment skipped: {e}")
-        return await scan_nuclei(urls, stealth_level=stealth)
+        # Nuclei self-salvages on its own timeout (it kills the process and parses
+        # the partial JSONL), so set that internal timeout at the task budget: it
+        # fires and returns partial findings before the orchestrator's hard cancel.
+        return await scan_nuclei(urls, stealth_level=stealth,
+                                 timeout=(current_task_budget() or 600.0))
 
     nuclei_id = orch.add_task(
         "Nuclei Scanner", _nuclei_scan,
@@ -2493,7 +2698,8 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
             if not ssl_targets:
                 return {"skipped": True, "reason": "no HTTPS/TLS targets found"}
             # scan_ssl_targets returns {"findings": [...], "vulnerabilities": [...], "total": int, ...}
-            return await scan_ssl_targets(ssl_targets)
+            return await scan_ssl_targets(ssl_targets,
+                                          time_budget=current_task_budget())
         except ImportError:
             return {}
 
@@ -2653,8 +2859,19 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                         urls.append(ep_url)
             if not urls:
                 return {"skipped": True, "reason": "no URLs to auth-scan"}
+            # Soft-cap the fan-out at 90% of this task's effective (scope/stealth-
+            # scaled) deadline so a throttling host with hundreds of crawled URLs
+            # returns the findings gathered so far instead of being cancelled at
+            # the hard timeout with total loss. Same soft-deadline pattern as the
+            # injection sweep. Using the *effective* timeout (not the 600s base)
+            # means an aggressive/full scan actually spends its scaled budget
+            # before the deadline rather than stopping hundreds of seconds early.
+            _auth_task = orch.tasks.get(auth_id)
+            _eff = orch._effective_timeout(_auth_task) if _auth_task else 600.0
             # scan_auth_targets returns {"findings": [...], "vulnerabilities": [...], "total": int}
-            return await scan_auth_targets(urls, crawl_data=crawl_data)
+            return await scan_auth_targets(
+                urls, crawl_data=crawl_data,
+                time_budget=(_eff * 0.9) if _eff else None)
         except ImportError:
             return {}
 
@@ -2663,6 +2880,45 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         phase=ScanPhase.VULN_SCAN, depends_on=[web_id, adapt_id],
         modes=WEBAPI_MODES,
         concurrency_group="web", timeout=600,
+    )
+
+    # ═══ Phase: OAUTH / OIDC / SAML FLOW ABUSE (account takeover) ═══
+    # Deeper than the auth scanner's endpoint discovery: reads the provider's
+    # discovery metadata for flow weaknesses (implicit flow, missing PKCE, ROPC)
+    # and proves redirect_uri bypass / password-reset host-poisoning / SAML
+    # signature-stripping on OBSERVED redirects and reflections only.
+    async def _oauth_flow_scan(**kw):
+        try:
+            from heaven.vulnscan.oauth_scanner import scan_oauth_flows
+        except ImportError:
+            return {}
+        urls = list(targets.get("urls", []))
+        reset_urls: list[str] = []
+        for _tid, res in orch.results.items():
+            if res.state != TaskState.COMPLETED or not res.data:
+                continue
+            data = res.data if isinstance(res.data, dict) else {}
+            for ep in data.get("endpoints", []):
+                ep_url = ep if isinstance(ep, str) else ep.get("url", "")
+                if not ep_url:
+                    continue
+                if ep_url not in urls:
+                    urls.append(ep_url)
+                low = ep_url.lower()
+                if any(h in low for h in ("reset", "forgot", "recover",
+                                          "lostpassword", "password")):
+                    reset_urls.append(ep_url)
+        if not urls:
+            return {"skipped": True, "reason": "no URLs for OAuth/SAML flow audit"}
+        return await scan_oauth_flows(
+            urls, reset_urls=reset_urls, oast=await orch.get_oast(),
+            time_budget=current_task_budget())
+
+    orch.add_task(
+        "OAuth / OIDC / SAML Flow Audit", _oauth_flow_scan,
+        phase=ScanPhase.VULN_SCAN, depends_on=[web_id, adapt_id],
+        modes=WEBAPI_MODES,
+        concurrency_group="web", timeout=300,
     )
 
     # ═══ Phase: WEB FUZZER ═══
@@ -2693,7 +2949,8 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
             # inter-request delay AND the parameter-discovery toggle from it, so
             # all four levels behave distinctly (not just a stealthy/loud binary).
             # fuzz_targets returns {"findings": [...], "vulnerabilities": [...], "total": int}
-            return await fuzz_targets(urls, stealth_level=stealth)
+            return await fuzz_targets(urls, stealth_level=stealth,
+                                      time_budget=current_task_budget())
         except ImportError:
             return {}
 
@@ -2729,7 +2986,7 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         # Returns {findings, vulnerabilities, web_components, hosts, total}.
         # The emitted `hosts` carry web_components only (no ports), so the CVE-map
         # phase does not re-map them and the inventory gains no phantom ports.
-        return await scan_web_tech(urls)
+        return await scan_web_tech(urls, time_budget=current_task_budget())
 
     web_tech_id = orch.add_task(
         "Web Technology Fingerprint (EOL + CVE)", _web_tech,
@@ -2756,7 +3013,7 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                     urls.append(ep_url)
         if not urls:
             return {"skipped": True, "reason": "no URLs to fingerprint"}
-        return await scan_edge_appliances(urls)
+        return await scan_edge_appliances(urls, time_budget=current_task_budget())
 
     edge_kev_id = orch.add_task(
         "Edge / VPN Appliance KEV Fingerprint", _edge_kev,
@@ -2769,7 +3026,6 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
     async def _misconfig_oob(**kw):
         try:
             from heaven.vulnscan.misconfig_scanner import scan_misconfig
-            from heaven.vulnscan.oast import OASTListener
             from heaven.vulnscan.oob_scanner import scan_oob
         except ImportError:
             return {}
@@ -2794,20 +3050,24 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
 
         findings: list[dict] = []
         # Deterministic, in-band misconfiguration checks (no collaborator needed).
-        mis = await scan_misconfig(urls)
+        mis = await scan_misconfig(urls, time_budget=current_task_budget())
         findings.extend(mis.get("findings", []))
 
         # Out-of-band SSRF / XXE / blind-cmdi proof needs a collaborator the
         # target can reach. Loopback by default (covers localhost/lab targets);
         # for a remote engagement you're authorized to receive callbacks from,
         # set HEAVEN_OAST_HOST=<routable-ip> (and optionally HEAVEN_OAST_BIND=
-        # 0.0.0.0 / HEAVEN_OAST_PORT). A finding fires only on a real callback.
-        try:
-            with OASTListener.from_env() as oast:
-                oob = await scan_oob(urls, oast=oast)
-                findings.extend(oob.get("findings", []))
-        except OSError as e:
-            logger.debug(f"OAST collaborator unavailable ({e}); skipping OOB probes")
+        # 0.0.0.0 / HEAVEN_OAST_PORT, plus HEAVEN_OAST_DNS_ZONE / PUBLIC_IP for a
+        # DNS channel). A finding fires only on a real callback. The run shares
+        # ONE collaborator (see ScanOrchestrator.get_oast) so the OOB and
+        # injection tasks never collide on the DNS bind.
+        oast = await orch.get_oast()
+        if oast is not None:
+            oob = await scan_oob(urls, oast=oast,
+                                 time_budget=current_task_budget())
+            findings.extend(oob.get("findings", []))
+        else:
+            logger.debug("OAST collaborator unavailable; skipping OOB probes")
 
         return {"findings": findings, "vulnerabilities": findings, "total": len(findings)}
 
@@ -2839,7 +3099,7 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                     urls.append(ep_url)
         if not urls:
             return {"skipped": True, "reason": "no URLs for client-side audit"}
-        return await scan_client_audit(urls)
+        return await scan_client_audit(urls, time_budget=current_task_budget())
 
     orch.add_task(
         "Client-side & Source Review", _client_audit,
@@ -2869,7 +3129,7 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                     urls.append(ep_url)
         if not urls:
             return {"skipped": True, "reason": "no URLs for CMS scan"}
-        return await scan_cms(urls)
+        return await scan_cms(urls, time_budget=current_task_budget())
 
     orch.add_task(
         "CMS Security Scan", _cms_scan,
@@ -2909,9 +3169,12 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         # Soft-cap the sweep at 90% of the hard task timeout so a slow target
         # yields the findings gathered so far instead of being cancelled with
         # total loss (which would also skip the dependent IDOR scan).
+        # The shared collaborator lets the SQLi path prove out-of-band DNS exfil
+        # (zero-FP) when the DNS channel is active; harmless no-op otherwise.
+        oast = await orch.get_oast()
         return await scan_for_injections(
             urls, forms_by_url=forms_by_url, stealth_level=stealth,
-            time_budget=_INJECTION_TIMEOUT_S * 0.9,
+            time_budget=_INJECTION_TIMEOUT_S * 0.9, oast=oast,
         )
 
     inject_id = orch.add_task(
@@ -2919,6 +3182,35 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         phase=ScanPhase.VULN_SCAN, depends_on=[web_id, adapt_id],
         modes=WEBAPI_MODES,
         concurrency_group="web", timeout=_INJECTION_TIMEOUT_S,
+    )
+
+    # ═══ Phase: BUSINESS-LOGIC ABUSE (numeric tampering + workflow step-skip) ═══
+    async def _logic_scan(**kw):
+        try:
+            from heaven.vulnscan.injection_scanner import build_injection_targets
+            from heaven.vulnscan.logic_scanner import scan_business_logic
+        except ImportError:
+            return {}
+        endpoints: list[dict] = []
+        for _tid, res in orch.results.items():
+            if getattr(res, "state", None) != TaskState.COMPLETED:
+                continue
+            data = res.data if isinstance(res.data, dict) else {}
+            for ep in data.get("endpoints", []):
+                if isinstance(ep, dict):
+                    endpoints.append(ep)
+        urls, forms_by_url = build_injection_targets(
+            endpoints, seed_urls=list(targets.get("urls", [])))
+        if not urls and not forms_by_url:
+            return {"skipped": True, "reason": "no URLs for business-logic scan"}
+        return await scan_business_logic(
+            urls, forms_by_url=forms_by_url, time_budget=current_task_budget())
+
+    orch.add_task(
+        "Business-Logic Abuse Scan", _logic_scan,
+        phase=ScanPhase.VULN_SCAN, depends_on=[web_id, adapt_id],
+        modes=WEBAPI_MODES,
+        concurrency_group="web", timeout=300,
     )
 
     # ═══ Phase: FILE-UPLOAD PROBE ═══
@@ -2942,7 +3234,8 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         # The scan pipeline runs under an established authorization (the CLI
         # `--i-have-authorization` gate has already passed), like the other
         # active web tasks; the probe writes only a benign inert marker file.
-        return await scan_upload_forms(endpoints, authorized=True)
+        return await scan_upload_forms(endpoints, authorized=True,
+                                       time_budget=current_task_budget())
 
     orch.add_task(
         "File Upload Probe", _upload_scan,
@@ -2977,7 +3270,9 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                 for p in data.get("profiles", []):
                     tech_hints.extend(p.get("tech", []))
                 tech_hints.extend(data.get("technologies", []))
-            return await fuzz_directories(base_urls, stealth_level=stealth, tech_hints=tech_hints)
+            return await fuzz_directories(base_urls, stealth_level=stealth,
+                                          tech_hints=tech_hints,
+                                          time_budget=current_task_budget())
         except ImportError:
             return {}
 
@@ -3016,6 +3311,7 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         return await scan_exposures(
             base_urls or page_urls, js_files=list(dict.fromkeys(js_files)),
             page_urls=list(dict.fromkeys(page_urls)), stealth_level=stealth,
+            time_budget=current_task_budget(),
         )
 
     orch.add_task(
@@ -3043,7 +3339,9 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                     forms_by_url.setdefault(url_str, []).extend(forms)
             if not urls:
                 return {"skipped": True, "reason": "no URLs for IDOR scanning"}
-            return await scan_for_idor(urls, forms_by_url=forms_by_url, stealth_level=stealth)
+            return await scan_for_idor(urls, forms_by_url=forms_by_url,
+                                       stealth_level=stealth,
+                                       time_budget=current_task_budget())
         except ImportError:
             return {}
 
@@ -3076,7 +3374,8 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                     ac_urls.append(ep_url)
         if not ac_urls:
             return {"skipped": True, "reason": "no URLs for access-control audit"}
-        return await scan_access_control(ac_urls, stealth_level=stealth)
+        return await scan_access_control(
+            ac_urls, stealth_level=stealth, time_budget=current_task_budget())
 
     orch.add_task(
         "Access Control Audit (multi-role)", _access_control,
@@ -3331,11 +3630,10 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
         if not targets.get("auto_prove"):
             return {"skipped": True, "reason": "--auto-prove flag not set"}
         try:
-            from heaven.vulnscan.exploit_proof import prove_finding
+            from heaven.vulnscan.exploit_proof import prove_finding, provable_category
         except Exception as e:
             return {"skipped": True, "reason": f"exploit_proof unimportable: {e}"}
 
-        provable_categories = ("sqli", "cmdi", "rce", "ssrf", "xss")
         candidates = []
         for tid, res in orch.results.items():
             if res.state != TaskState.COMPLETED or not res.data:
@@ -3346,7 +3644,11 @@ def build_full_scan(targets: dict, config: Optional[HeavenConfig] = None,
                       + data.get("validated_findings", [])):
                 vt = (f.get("vuln_type") or f.get("type") or "").lower()
                 conf = float(f.get("confidence") or 0)
-                if conf >= 0.8 and any(cat in vt for cat in provable_categories):
+                # Whole-token match (provable_category), not a raw substring, so a
+                # finding whose type merely contains the letters "rce" (e.g.
+                # resource_based_constrained_delegation) is never fed to the RCE
+                # command-execution prover.
+                if conf >= 0.8 and provable_category(vt):
                     candidates.append(f)
         if not candidates:
             return {"skipped": True, "reason": "no high-confidence findings to prove"}

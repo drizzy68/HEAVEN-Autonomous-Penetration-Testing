@@ -133,6 +133,14 @@ class CVERecord:
     # OpenSSH, which was backport-fixed within days of disclosure.) Such records
     # are dropped for distro-packaged banners; see ``_is_distro_packaged``.
     distro_backport_fixed: bool = False
+    # True when the flaw is exploited against the CONNECTING CLIENT or local
+    # tooling (ssh-agent, scp, the ssh client's ProxyCommand), not the listening
+    # service being scanned. HEAVEN maps a version banner off a *server* port, so
+    # a client-side CVE cannot make that server remotely vulnerable — reporting it
+    # as a service finding is a false positive (a scanned sshd is not attackable
+    # via scp/ssh-agent/ProxyCommand bugs). Such records are dropped from
+    # service-version findings; see ``_drop_client_side_only``.
+    client_side: bool = False
 
 
 # Format: version string may be:
@@ -146,13 +154,18 @@ INLINE_CVE_DB: dict[str, list[CVERecord]] = {
         CVERecord("CVE-2023-38408", "OpenSSH ssh-agent RCE via forwarded agent",
                   # The vulnerable code path is ssh-agent's PKCS#11 provider, added
                   # in OpenSSH 5.4 — older releases (e.g. 4.7p1) predate it, so a
-                  # bare "<=9.3p1" would falsely flag them.
-                  "critical", 9.8, [">=5.4", "<=9.3p1"], exploit_available=True, cwe="CWE-78"),
+                  # bare "<=9.3p1" would falsely flag them. client_side: the flaw is
+                  # in ssh-agent (runs on the CLIENT), reached only when a client
+                  # forwards its agent to a malicious server — a scanned sshd is not
+                  # remotely vulnerable, so it must not surface as a server finding.
+                  "critical", 9.8, [">=5.4", "<=9.3p1"], exploit_available=True, cwe="CWE-78",
+                  client_side=True),
         CVERecord("CVE-2023-51385", "OpenSSH shell metacharacter injection in ProxyCommand",
                   # Fixed IN OpenSSH 9.6 (NVD: "before 9.6"), so 9.6/9.6p1 are
                   # patched — the ceiling is strict "<9.6", not "<=9.6" which
-                  # over-matched the fixed release.
-                  "high", 7.5, ["<9.6"], cwe="CWE-78"),
+                  # over-matched the fixed release. client_side: ProxyCommand is
+                  # ssh CLIENT config; the server plays no part.
+                  "high", 7.5, ["<9.6"], cwe="CWE-78", client_side=True),
         # Terrapin is an SSH *transport-protocol* weakness (prefix truncation of
         # the binary packet stream), so it belongs to the SSH server, not to
         # unrelated services that merely speak another protocol. It only affects a
@@ -169,9 +182,15 @@ INLINE_CVE_DB: dict[str, list[CVERecord]] = {
         CVERecord("CVE-2021-41617", "OpenSSH privilege escalation via AuthorizedKeysCommand",
                   "high", 7.0, [">=6.2", "<=8.8"], cwe="CWE-269"),
         CVERecord("CVE-2020-15778", "OpenSSH scp shell injection via filenames",
-                  "high", 7.8, ["<=8.4"], exploit_available=True, cwe="CWE-78"),
+                  # client_side: exploited in the scp CLIENT's local command
+                  # construction, not by attacking the sshd being scanned.
+                  "high", 7.8, ["<=8.4"], exploit_available=True, cwe="CWE-78",
+                  client_side=True),
         CVERecord("CVE-2019-6111", "OpenSSH scp malicious server overwrites local files",
-                  "medium", 5.9, ["<=7.9"], cwe="CWE-22"),
+                  # client_side: the victim is the scp CLIENT connecting to a
+                  # malicious server. A scanned server being this version does not
+                  # make IT vulnerable — flagging it inverts who is at risk.
+                  "medium", 5.9, ["<=7.9"], cwe="CWE-22", client_side=True),
         CVERecord("CVE-2018-15473", "OpenSSH username enumeration via timing oracle",
                   "medium", 5.3, ["<=7.7"], exploit_available=True, cwe="CWE-200"),
         CVERecord("CVE-2016-20012", "OpenSSH username enumeration via keyboard-interactive auth",
@@ -189,18 +208,24 @@ INLINE_CVE_DB: dict[str, list[CVERecord]] = {
         # explicit >=2.4.0 floor — without it a bare "<=2.4.x" ceiling also
         # matched ancient 2.2/2.0 servers (e.g. Metasploitable's 2.2.8), a false
         # positive of a modern-branch CVE on legacy software.
-        CVERecord("CVE-2022-31813", "Apache HTTP request smuggling mod_proxy",
-                  "high", 7.5, [">=2.4.0", "<=2.4.53"], cwe="CWE-444"),
+        CVERecord("CVE-2022-31813", "Apache mod_proxy drops X-Forwarded-* enabling IP authentication bypass",
+                  "high", 7.5, [">=2.4.0", "<=2.4.53"], cwe="CWE-348"),
         CVERecord("CVE-2022-22720", "Apache HTTP request smuggling (incomplete fix)",
                   "high", 7.5, [">=2.4.0", "<=2.4.52"], cwe="CWE-444"),
-        CVERecord("CVE-2022-22721", "Apache SSRF via mod_lua",
-                  "critical", 9.8, [">=2.4.0", "<=2.4.52"], cwe="CWE-918"),
+        CVERecord("CVE-2022-22721", "Apache integer overflow and out-of-bounds write (large request body)",
+                  "critical", 9.8, [">=2.4.0", "<=2.4.52"], cwe="CWE-190"),
         CVERecord("CVE-2021-44224", "Apache server-side request forgery in forward proxy",
                   "high", 8.2, [">=2.4.0", "<=2.4.51"], cwe="CWE-918"),
         CVERecord("CVE-2021-40438", "Apache SSRF in mod_proxy",
                   "critical", 9.0, [">=2.4.0", "<=2.4.48"], exploit_available=True, cwe="CWE-918"),
+        # The crashing code path (mod_proxy_http mishandling a request that
+        # carries BOTH Content-Length and Transfer-Encoding) was introduced in
+        # 2.4.41 and fixed in 2.4.47, so the NVD CPE window is 2.4.41–2.4.46. A
+        # bare ">=2.4.0" branch floor flagged every older 2.4 release (e.g. a
+        # 2.4.7 on Ubuntu 14.04) that predates the vulnerable code by 34 point
+        # releases — a false positive. Floor at the introduced-in version.
         CVERecord("CVE-2020-13950", "Apache mod_proxy_http NULL pointer dereference DoS",
-                  "high", 7.5, [">=2.4.0", "<=2.4.46"], cwe="CWE-476"),
+                  "high", 7.5, [">=2.4.41", "<=2.4.46"], cwe="CWE-476"),
         CVERecord("CVE-2019-10082", "Apache mod_http2 read-after-free",
                   "high", 7.5, [">=2.4.17", "<=2.4.39"], cwe="CWE-416"),
         # These two genuinely span the 2.2 AND 2.4 lines, so both branch windows
@@ -227,10 +252,19 @@ INLINE_CVE_DB: dict[str, list[CVERecord]] = {
     "microsoft_iis": [
         CVERecord("CVE-2017-7269", "IIS 6.0 WebDAV buffer overflow RCE",
                   "critical", 10.0, ["6.0"], exploit_available=True, cwe="CWE-119"),
+        # Both HTTP Protocol Stack (http.sys) RCEs live in the kernel driver that
+        # ships only with IIS 10.0 (Windows 10 2004+/Server 2019+); IIS 6.0/7.x/8.x
+        # run earlier Windows releases that do not contain the affected http.sys
+        # code path. A bare "<=10.0" ceiling (single-ceiling records stay
+        # open-ended-down by design) therefore swept every older IIS generation
+        # into two CRITICAL findings it cannot have. Floor at >=10.0 so only the
+        # IIS 10.0 generation matches. No false negative: no IIS below 10.0 is
+        # affected. The build-level patch state of a given 10.0 host still can't be
+        # read from the banner, which is the usual version-range caveat.
         CVERecord("CVE-2021-31166", "IIS HTTP Protocol Stack RCE",
-                  "critical", 9.8, ["<=10.0"], exploit_available=True, cwe="CWE-416"),
+                  "critical", 9.8, [">=10.0", "<=10.0"], exploit_available=True, cwe="CWE-416"),
         CVERecord("CVE-2022-21907", "IIS HTTP Protocol Stack RCE (worm-level)",
-                  "critical", 9.8, ["<=10.0.19041"], exploit_available=True, cwe="CWE-416"),
+                  "critical", 9.8, [">=10.0", "<=10.0.19041"], exploit_available=True, cwe="CWE-416"),
     ],
     "mysql": [
         # NVD affects two explicit windows — 5.0.0–5.7.41 and 8.0.0–8.0.32 — so a
@@ -1038,6 +1072,45 @@ def _drop_distro_backport_fixed(cves: list[CVERecord], banner: str) -> list[CVER
     return [c for c in cves if not c.distro_backport_fixed]
 
 
+def _drop_client_side_only(cves: list[CVERecord]) -> list[CVERecord]:
+    """Remove ``client_side`` records from a service-version finding set.
+
+    HEAVEN maps a version banner off a *listening service* on the target, so a
+    flaw that is only exploitable against the connecting client or local tooling
+    (scp, ssh-agent, the ssh client's ProxyCommand) cannot make that server
+    remotely vulnerable. Emitting it as a CRITICAL/HIGH service finding — e.g.
+    CVE-2023-38408 (ssh-agent) or CVE-2020-15778 (scp) against a scanned sshd —
+    is a false positive that inverts who is actually at risk. Unlike the distro
+    backport drop, this is unconditional: no banner or version makes a scanned
+    server exposed to a purely client-side bug."""
+    if not cves:
+        return cves
+    return [c for c in cves if not c.client_side]
+
+
+# Recent CLIENT-side OpenSSH CVEs the inline DB does not carry, so the LIVE NVD
+# path (which has no client_side flag) can drop them the way
+# _drop_client_side_only drops the inline ones. CVE-2025-26465 is the
+# VerifyHostKeyDNS machine-in-the-middle: the victim is the ssh CLIENT verifying
+# a host key (only when the non-default VerifyHostKeyDNS is on), never the
+# scanned sshd — so a version-confirmed hit on an OpenSSH 9.9 SERVER inverts who
+# is at risk. A live scan of www.certifiedhacker.com surfaced exactly this as a
+# medium "vulnerable_service" on port 22.
+_EXTRA_CLIENT_SIDE_CVES: frozenset[str] = frozenset({
+    "CVE-2025-26465",
+})
+
+
+def _client_side_cve_ids() -> frozenset[str]:
+    """IDs of CVEs that are client-side-only: every inline ``client_side`` record
+    plus :data:`_EXTRA_CLIENT_SIDE_CVES`. The live NVD path filters confirmed
+    hits against this so a client-side CVE is never asserted as a server
+    exposure, mirroring :func:`_drop_client_side_only` for the inline path."""
+    inline = {r.cve_id.upper() for recs in INLINE_CVE_DB.values()
+              for r in recs if r.client_side}
+    return frozenset(inline | _EXTRA_CLIENT_SIDE_CVES)
+
+
 def lookup_inline_cves(product_key: str, version: str) -> list[CVERecord]:
     """Return CVEs from INLINE_CVE_DB matching product and version.
 
@@ -1092,8 +1165,8 @@ def detect_zero_day_indicators(service: str, version: str, banner: str) -> list[
     product_key = fp[0] if fp else service.lower()
     version_str = (fp[1] if fp else "") or version
 
-    inline_hits = _drop_distro_backport_fixed(
-        lookup_inline_cves(product_key, version_str), banner)
+    inline_hits = _drop_client_side_only(_drop_distro_backport_fixed(
+        lookup_inline_cves(product_key, version_str), banner))
     for cve_rec in inline_hits:
         indicators.append({
             "type": "known_vulnerable_version",
@@ -1152,6 +1225,7 @@ async def map_vulnerabilities(host_results: list[dict], nvd_client: Any = None,
     """
     all_vulns: list[dict] = []
     live_used = 0
+    client_side_ids = _client_side_cve_ids()
 
     for host in host_results:
         for port_info in host.get("open_ports", []):
@@ -1178,6 +1252,10 @@ async def map_vulnerabilities(host_results: list[dict], nvd_client: Any = None,
             # version cannot establish exposure and the match is near-always a FP.
             inline_cves = _drop_distro_backport_fixed(
                 inline_cves, f"{banner} {nmap_product} {version}")
+            # Client-side-only CVEs (scp/ssh-agent/ProxyCommand) describe risk to
+            # hosts CONNECTING with this tooling, not to the scanned server, so
+            # they never belong in a service-version finding for that server.
+            inline_cves = _drop_client_side_only(inline_cves)
 
             # 3a. Dynamic fallback — fire when the inline DB produced NO
             #     version-matched CVE for this service. That covers two cases:
@@ -1225,6 +1303,12 @@ async def map_vulnerabilities(host_results: list[dict], nvd_client: Any = None,
                     confirmed = [lc for lc in live_hits if lc.version_confirmed]
                     unconfirmed = [lc for lc in live_hits if not lc.version_confirmed]
                     for lc in confirmed:
+                        # A client-side-only CVE (e.g. CVE-2025-26465, the
+                        # VerifyHostKeyDNS MITM) describes risk to hosts CONNECTING
+                        # with this tooling, not to the scanned server, so it never
+                        # belongs in a server service-version finding.
+                        if (lc.cve_id or "").upper() in client_side_ids:
+                            continue
                         lc_score, lc_sev = _score_and_severity(lc.cvss, lc.severity)
                         all_vulns.append({
                             "host": host_name,

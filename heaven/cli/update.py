@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
+import socket
 import subprocess  # nosec B404 # runs vetted CLI tools (git/pip/npm), never a shell
 import sys
 import time
@@ -62,6 +64,50 @@ _VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.M)
 # Touching any of these (or a requirements*.txt) means dependencies/entry points
 # may have changed → re-run the editable install so they actually land.
 _DEP_FILES = ("pyproject.toml", "setup.py", "setup.cfg")
+
+# Tracked files that HEAVEN's OWN build regenerates deterministically. A fresh
+# `git clone && ./scripts/install.sh` (and the updater's own UI rebuild) used to
+# run `npm install`, which rewrites the tracked lockfile — so a just-installed
+# tree shows up "dirty" on these through no user action, which then made every
+# self-update refuse ("uncommitted changes"). That is the trap essentially every
+# user hits once. These are safe to reset to HEAD before a fast-forward because
+# the post-update rebuild regenerates them from source (package.json), so no real
+# work is lost. NEVER add a hand-edited source file here — only machine-generated
+# build artifacts that happen to be tracked. Builds now prefer `npm ci` (see
+# `_ui_rebuild` / install.sh), which never writes the lockfile, so new installs
+# stop generating this phantom dirt at the source; this list is the bridge for
+# trees already dirtied by an older `npm install`.
+_REGENERABLE_TRACKED = frozenset({
+    "heaven-ui/package-lock.json",
+})
+
+
+def _porcelain_path(line: str) -> str:
+    """Extract the path from a ``git status --porcelain`` line, tolerant of the
+    leading space our :func:`_run_git` strips off the first entry.
+
+    Porcelain v1 lines are ``XY <path>`` (two single-char status columns then a
+    space). Because ``_run_git`` runs ``.strip()`` on the whole blob, the FIRST
+    line can arrive with its leading space removed (``M <path>`` instead of
+    `` M <path>``), so a fixed ``line[3:]`` slice ate the first character of that
+    path. Strip a leading run of status chars followed by a space instead, which
+    is correct whether or not that leading space survived.
+    """
+    return re.sub(r"^[ MADRCUT?!]{1,2} ", "", line)
+
+
+def _classify_dirty(files: list[str]) -> tuple[list[str], list[str]]:
+    """Split dirty paths into ``(regenerable_artifacts, blocking_user_edits)``.
+
+    Regenerable artifacts are machine-generated files the build itself rewrites
+    and can safely reset+regenerate; everything else is treated as genuine work
+    that must never be overwritten without an explicit ``--force``.
+    """
+    regen: list[str] = []
+    blocking: list[str] = []
+    for f in files:
+        (regen if f in _REGENERABLE_TRACKED else blocking).append(f)
+    return regen, blocking
 
 
 def _parse_version(text: str) -> str:
@@ -121,6 +167,123 @@ def _run_git(root: Path, *args: str, timeout: int = 60) -> tuple[int, str, str]:
         return 1, "", f"{type(e).__name__}: {e}"
 
 
+# ── Pre-flight remote reachability ───────────────────────────────────────────
+# git cannot bound its own TCP connect on every platform: `http.connectTimeout`
+# is a libcurl option only some builds honor (on macOS git 2.54 it is ignored, so
+# a dead host hangs ~21-75s on the kernel's SYN timeout before `git fetch` gives
+# up). That is exactly the long opaque hang users hit when GitHub is blocked by a
+# firewall/VPN or the box is offline. So before the real fetch we do ONE short,
+# bounded TCP connect to the remote host and, if it fails, report an honest,
+# classified, actionable message in seconds instead. The probe FAILS OPEN (treats
+# the remote as reachable) whenever it can't be sure — behind a proxy, a local
+# path remote, or on any probe glitch — so it can never block a legitimate update;
+# it only short-circuits a genuinely unreachable network.
+
+DEFAULT_CONNECT_TIMEOUT_S = 6.0
+_PROXY_ENV_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                   "ALL_PROXY", "all_proxy")
+_SCHEME_DEFAULT_PORT = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
+
+
+def _connect_timeout_s() -> float:
+    """Per-probe TCP connect budget (seconds). Override with
+    ``HEAVEN_UPDATE_CONNECT_TIMEOUT``; clamped to a sane 1-30s window."""
+    try:
+        return max(1.0, min(30.0, float(
+            os.environ.get("HEAVEN_UPDATE_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT_S))))
+    except (TypeError, ValueError):
+        return DEFAULT_CONNECT_TIMEOUT_S
+
+
+def _parse_remote_endpoint(url: str) -> Optional[tuple[str, int, str]]:
+    """``(host, port, scheme)`` to TCP-probe for a git remote URL, or ``None`` when
+    it is a local path / unparseable (then the probe is skipped and git just tries).
+
+    Handles ``https`` / ``http`` / ``ssh`` / ``git`` URLs and the scp-like
+    ``git@host:owner/repo.git`` form, stripping any embedded credentials.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    if "://" not in url:
+        # scp-like `[user@]host:path`. Distinguish from a local path (`/repo`,
+        # `./x`) and a Windows drive (`C:\repo`): the part before the first colon
+        # must have no slash AND either carry a `user@` or look like a hostname
+        # (contain a dot), which a bare drive letter never does.
+        head = url.split(":", 1)[0]
+        if ":" in url and "/" not in head and ("@" in head or "." in head):
+            host = head.split("@", 1)[-1]
+            if host:
+                return host, 22, "ssh"
+        return None
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if not host:
+            return None
+        scheme = (parts.scheme or "").lower()
+        port = parts.port or _SCHEME_DEFAULT_PORT.get(scheme, 443)
+        return host, int(port), scheme or "https"
+    except Exception:  # noqa: BLE001 — unparseable URL → skip the probe
+        return None
+
+
+def _probe_tcp(host: str, port: int, timeout: float) -> tuple[bool, str]:
+    """One bounded TCP connect. Returns ``(reachable, reason_if_not)`` with the
+    failure classified so the message can tell network-down from DNS from a block.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, ""
+    except socket.gaierror:
+        return False, f"DNS lookup for {host} failed"
+    except (socket.timeout, TimeoutError):
+        return False, f"connection to {host}:{port} timed out after {timeout:.0f}s"
+    except ConnectionRefusedError:
+        return False, f"{host}:{port} refused the connection"
+    except OSError as e:  # no route to host, network down, etc.
+        return False, f"{host}:{port} unreachable ({e.strerror or type(e).__name__})"
+
+
+def _proxy_configured(root: Path) -> bool:
+    """A proxy routes git's traffic, so a direct TCP probe would wrongly report the
+    remote unreachable. Detect one (env vars or git's own ``http.proxy``) and skip
+    the probe when present."""
+    if any(os.environ.get(k) for k in _PROXY_ENV_KEYS):
+        return True
+    rc, out, _ = _run_git(root, "config", "--get", "http.proxy")
+    return rc == 0 and bool(out.strip())
+
+
+def _remote_endpoint(root: Path, remote: str) -> Optional[tuple[str, int, str]]:
+    """Resolve the ``remote``'s URL (via git) into a probe endpoint, or ``None``."""
+    rc, url, _ = _run_git(root, "remote", "get-url", remote)
+    if rc != 0 or not url:
+        rc, url, _ = _run_git(root, "config", "--get", f"remote.{remote}.url")
+    return _parse_remote_endpoint(url if rc == 0 else "")
+
+
+def _preflight_remote(root: Path, remote: str) -> tuple[bool, str, str]:
+    """Fast reachability pre-check before the slow ``git fetch``.
+
+    Returns ``(reachable, reason, host)``. Fails OPEN (``reachable=True``) whenever
+    it can't be sure, so it never blocks a real update; it only short-circuits a
+    genuinely dead network with an honest, classified message.
+    """
+    try:
+        if _proxy_configured(root):
+            return True, "", ""
+        ep = _remote_endpoint(root, remote)
+        if ep is None:
+            return True, "", ""
+        host, port, _scheme = ep
+        ok, reason = _probe_tcp(host, port, _connect_timeout_s())
+        return ok, reason, host
+    except Exception:  # noqa: BLE001 — a probe glitch must never block an update
+        return True, "", ""
+
+
 @dataclass
 class UpdateCheck:
     """Result of asking 'is a newer HEAVEN available, and can I take it?'."""
@@ -137,7 +300,13 @@ class UpdateCheck:
     ahead: int = 0               # local commits not yet pushed
     dirty: bool = False
     dirty_files: list[str] = field(default_factory=list)
+    # `dirty_files` split by whether it actually blocks an update. Machine
+    # generated build artifacts (see _REGENERABLE_TRACKED) are reset+regenerated,
+    # so only `dirty_blocking` (genuine edits) holds a plain update back.
+    dirty_regenerable: list[str] = field(default_factory=list)
+    dirty_blocking: list[str] = field(default_factory=list)
     remote_reachable: bool = True
+    remote_host: str = ""        # host we probed/fetched from (for honest messages)
     available: bool = False      # behind > 0
     error: str = ""
 
@@ -155,7 +324,10 @@ class UpdateCheck:
             "ahead": self.ahead,
             "dirty": self.dirty,
             "dirty_files": self.dirty_files,
+            "dirty_regenerable": self.dirty_regenerable,
+            "dirty_blocking": self.dirty_blocking,
             "remote_reachable": self.remote_reachable,
+            "remote_host": self.remote_host,
             "available": self.available,
             "error": self.error,
         }
@@ -192,8 +364,10 @@ def _inspect_repo(root: Path) -> UpdateCheck:
     rc, out, _ = _run_git(root, "status", "--porcelain")
     files = [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
     c.dirty = bool(files)
-    # Porcelain lines are "XY <path>"; strip the 3-char status prefix for display.
-    c.dirty_files = [ln[3:] if len(ln) > 3 else ln for ln in files]
+    # Porcelain lines are "XY <path>"; strip the status prefix (see _porcelain_path
+    # for why a fixed slice is wrong for the first, leading-space-stripped line).
+    c.dirty_files = [_porcelain_path(ln) for ln in files]
+    c.dirty_regenerable, c.dirty_blocking = _classify_dirty(c.dirty_files)
     return c
 
 
@@ -209,6 +383,16 @@ def check_for_update(root: Path, *, fetch: bool = True) -> UpdateCheck:
     c = _inspect_repo(root)
 
     if fetch:
+        # Fail fast on a dead network: a bounded TCP probe (seconds) before the
+        # fetch, which can otherwise hang ~21s+ on a blocked host (see the
+        # pre-flight helpers above). Fails open, so a reachable remote always
+        # proceeds to the real fetch, which still surfaces auth/other errors.
+        reachable, reason, host = _preflight_remote(root, c.remote)
+        c.remote_host = host
+        if not reachable:
+            c.remote_reachable = False
+            c.error = reason or "remote unreachable"
+            return c
         rc, _, err = _run_git(root, "fetch", "--quiet", "--tags", c.remote, timeout=120)
         if rc != 0:
             c.remote_reachable = False
@@ -289,12 +473,28 @@ def _ui_rebuild(root: Path) -> tuple[bool, str]:
         return False, "heaven-ui/ not present"
     if shutil.which("npm") is None:
         return (False, "npm not on PATH, rebuild later: "
-                       "cd heaven-ui && npm install --legacy-peer-deps && npm run build")
+                       "cd heaven-ui && npm ci --legacy-peer-deps && npm run build")
     try:
-        inst = subprocess.run(  # nosec B603 B607 # fixed npm argv, no shell
-            ["npm", "install", "--legacy-peer-deps"],
+        # Prefer `npm ci`: it installs strictly from package-lock.json and never
+        # rewrites it, so the rebuild leaves the tree clean and the NEXT update is
+        # not blocked by a lockfile the build itself changed. Fall back to
+        # `npm install` only when there is no lockfile or the lock has drifted out
+        # of sync with package.json (npm ci refuses that) so an install still
+        # succeeds — Layer-2 dirty handling then covers the resulting phantom dirt.
+        used_ci = (ui / "package-lock.json").is_file()
+        # B607 is not raised here (the argv is a ternary, not a literal list
+        # bandit can inspect), so only B603 needs suppressing on this line;
+        # lines below use literal ["npm", ...] lists and keep B607.
+        inst = subprocess.run(  # nosec B603 # fixed npm argv, no shell
+            ["npm", "ci", "--legacy-peer-deps"] if used_ci
+            else ["npm", "install", "--legacy-peer-deps"],
             cwd=str(ui), capture_output=True, text=True, timeout=900,
         )
+        if inst.returncode != 0 and used_ci:
+            inst = subprocess.run(  # nosec B603 B607 # fixed npm argv, no shell
+                ["npm", "install", "--legacy-peer-deps"],
+                cwd=str(ui), capture_output=True, text=True, timeout=900,
+            )
         if inst.returncode != 0:
             return False, "npm install failed: " + (inst.stderr or inst.stdout or "")[:200]
         bld = subprocess.run(  # nosec B603 B607 # fixed npm argv, no shell
@@ -344,14 +544,33 @@ def apply_code_update(root: Path, check: UpdateCheck, *, force: bool = False,
     if not check.available:
         res.notes.append("already up to date")
         return res
-    if check.dirty and not force:
+
+    # Only *genuine* edits block. Machine-generated build artifacts the build
+    # itself rewrote (the npm lockfile) are neither the user's work nor a reason
+    # to refuse: we reset them to HEAD just below and the post-update rebuild
+    # regenerates them. This is what unblocks the "just installed → every update
+    # refused" trap without ever discarding real work.
+    blocking = list(check.dirty_blocking)
+    regen = list(check.dirty_regenerable)
+    if blocking and not force:
         res.error = "uncommitted local changes, refusing to overwrite them (use --force to auto-stash)"
         return res
 
     old_sha = check.current_sha or "HEAD"
 
-    # --force: preserve local changes non-destructively around the pull.
-    if check.dirty and force:
+    # Reset only the allowlisted regenerable artifacts so the fast-forward is
+    # clean. Safe: they are rebuilt from source (package.json) right after.
+    for f in regen:
+        rc, _, err = _run_git(root, "checkout", "--", f)
+        if rc == 0:
+            res.notes.append(f"reset auto-generated {f} (the build regenerates it after update)")
+        else:
+            res.notes.append(f"note: could not reset {f}: {err[:120]}")
+
+    # --force with genuine edits still present: preserve them non-destructively
+    # around the pull. (Regenerable artifacts were reset above, so a lockfile no
+    # longer lands in the stash to conflict on pop.)
+    if blocking and force:
         rc, _, err = _run_git(root, "stash", "push", "--include-untracked",
                               "-m", "heaven-update-autostash")
         if rc != 0:
@@ -528,16 +747,22 @@ def _render_check(c: UpdateCheck) -> None:
         _print(_non_git_message())
         return
     if not c.remote_reachable:
-        _print(f"  [yellow]Couldn't reach the remote:[/yellow] {c.error}")
-        _print("  [dim]Check your network / proxy and try again.[/dim]")
+        host = c.remote_host or "the remote"
+        _print(f"  [yellow]Couldn't reach {host}:[/yellow] {c.error}")
+        _print("  [dim]Usually a network, firewall, or proxy issue on this machine, not a[/dim]")
+        _print("  [dim]HEAVEN fault. Check connectivity (or set HTTPS_PROXY behind a proxy),[/dim]")
+        _print("  [dim]then try again.[/dim]")
         return
     if c.available:
         _print(f"  [bold green]Update available:[/bold green] "
                f"v{c.current_version or '?'} → v{c.latest_version or '?'} "
                f"({c.behind} commit(s) behind {c.upstream})")
-        if c.dirty:
-            _print(f"  [yellow]Note:[/yellow] {len(c.dirty_files)} uncommitted change(s) ·  "
+        if c.dirty_blocking:
+            _print(f"  [yellow]Note:[/yellow] {len(c.dirty_blocking)} uncommitted change(s) ·  "
                    "`heaven update` will hold back unless you pass --force.")
+        elif c.dirty_regenerable:
+            _print(f"  [dim]({len(c.dirty_regenerable)} auto-generated build file(s) will be "
+                   "refreshed automatically, no action needed.)[/dim]")
         _print("  Run [bold]heaven update[/bold] to apply.")
     else:
         _print(f"  [green]You're on the latest version[/green] (v{c.current_version or '?'}).")
@@ -565,7 +790,13 @@ def _self_update(summary: UpdateSummary, *, force: bool, skip_ui: bool) -> None:
         summary.errors.append(f"code: {c.reason}")
         return
     if not c.remote_reachable:
-        _print(f"  [yellow]⚠ Code:[/yellow] couldn't reach the remote ({c.error}) · skipping self-update.")
+        host = c.remote_host or "the remote"
+        _print(f"  [yellow]⚠ Code:[/yellow] couldn't reach {host} ({c.error}) · skipping self-update.")
+        _print("      [dim]Usually a network/firewall/VPN issue on this machine, not a HEAVEN fault:[/dim]")
+        _print("      [dim]· confirm you're online and GitHub isn't blocked here[/dim]")
+        _print("      [dim]· behind a proxy? set HTTPS_PROXY=http://host:port and re-run[/dim]")
+        _print("      [dim]· private repo? make sure git can authenticate (gh auth login / SSH key)[/dim]")
+        _print(f"      [dim]· once connected, update manually: git -C {root} pull --ff-only[/dim]")
         summary.code_note = f"remote unreachable: {c.error}"
         summary.errors.append(f"code: {c.error}")
         return
@@ -577,13 +808,13 @@ def _self_update(summary: UpdateSummary, *, force: bool, skip_ui: bool) -> None:
         _print(f"  [green]✓ Code:[/green] already up to date (v{c.current_version or '?'})")
         summary.code_note = "up to date"
         return
-    if c.dirty and not force:
+    if c.dirty_blocking and not force:
         _print(f"  [yellow]⚠ Code:[/yellow] v{c.latest_version or '?'} is available, but you have "
-               f"{len(c.dirty_files)} uncommitted change(s): not overwriting them.")
-        for f_ in c.dirty_files[:8]:
+               f"{len(c.dirty_blocking)} uncommitted change(s): not overwriting them.")
+        for f_ in c.dirty_blocking[:8]:
             _print(f"      [dim]· {f_}[/dim]")
-        if len(c.dirty_files) > 8:
-            _print(f"      [dim]· …and {len(c.dirty_files) - 8} more[/dim]")
+        if len(c.dirty_blocking) > 8:
+            _print(f"      [dim]· …and {len(c.dirty_blocking) - 8} more[/dim]")
         _print("      Commit/stash them, or re-run with [bold]--force[/bold] (auto-stash).")
         summary.code_note = "held back: uncommitted local changes"
         summary.errors.append("code: uncommitted local changes (use --force)")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 import socket
 import ssl
 from dataclasses import dataclass, field
@@ -307,6 +308,29 @@ async def _resolve_subdomain(fqdn: str, sem: asyncio.Semaphore) -> Optional[Disc
 
 # ── JavaScript Secret Extraction ──
 
+def _js_secret_is_placeholder(value: str) -> bool:
+    """True when a captured JS 'secret' value is template scaffolding or an
+    obvious doc stub rather than a live credential: ${API_KEY}, {{token}},
+    <your-key>, %(secret)s, a YOUR_* stub, or an example/dummy/sample/redacted/
+    changeme filler. Mirrors the git_secrets / client_audit placeholder screen so
+    a config template or example baked into a JS bundle is not reported as a leak.
+    A bare '$' or '<' is NOT a signal (a real value may carry them); 'test' and
+    'xxx' are deliberately excluded here to avoid screening a live sk_test_ key or
+    an 'attestation' token on the bare value."""
+    v = value.strip()
+    low = v.lower()
+    if "${" in v or "{{" in v or "}}" in v:
+        return True
+    if "<" in v and ">" in v:
+        return True
+    if "%(" in low or "%s" in low or "%d" in low:
+        return True
+    if low.startswith("your"):
+        return True
+    return any(w in low for w in ("example", "placeholder", "redacted",
+                                  "dummy", "sample", "changeme", "changethis"))
+
+
 JS_SECRET_PATTERNS = [
     (r"(?:api[_-]?key|apikey)\s*[:=]\s*['\"]([a-zA-Z0-9_\-]{20,})['\"]", "api_key"),
     (r"(?:secret|token|password|passwd|pwd)\s*[:=]\s*['\"]([^'\"]{8,})['\"]", "secret"),
@@ -345,8 +369,12 @@ async def extract_js_secrets(session: aiohttp.ClientSession, url: str,
                 for pattern, secret_type in JS_SECRET_PATTERNS:
                     matches = re.findall(pattern, content, re.IGNORECASE)
                     for match in matches:
-                        # Filter false positives
-                        if len(match) < 8 or match in ("undefined", "null", "true", "false"):
+                        # Filter false positives: too short, JS literals, or a
+                        # template placeholder / example stub (${API_KEY},
+                        # {{token}}, <your-key>, example-api-key) that carries no
+                        # live secret.
+                        if (len(match) < 8 or match in ("undefined", "null", "true", "false")
+                                or _js_secret_is_placeholder(match)):
                             continue
                         secrets.append(DiscoveredAsset(
                             asset_type="secret", value=match[:50],
@@ -665,9 +693,41 @@ async def fuzz_endpoints(session: aiohttp.ClientSession, base_url: str,
                           paths: Optional[list[str]] = None,
                           concurrency: int = 50) -> list[DiscoveredAsset]:
     """Discover hidden API endpoints and sensitive files."""
-    discovered = []
+    discovered: list[DiscoveredAsset] = []
     target_paths = paths or COMMON_API_PATHS
     sem = asyncio.Semaphore(concurrency)
+
+    # Catch-all / soft-404 baseline. Shared hosting, parked domains and SPA
+    # origins answer EVERY path with the same 200 HTML shell, so a bare 200 is
+    # not proof an endpoint exists. Probe a random path that cannot exist; if it
+    # returns a 200 HTML page the origin is a catch-all, and any speculative
+    # /api, /graphql, /v1 ... that returns the same shell (same status, HTML,
+    # ~same size) is a PHANTOM — dropping it here stops the whole COMMON_API_PATHS
+    # list from being "discovered" and fed forward to the API/web scanners, which
+    # would otherwise run their full battery against dozens of nonexistent paths
+    # (and, pre-guard, time out doing so). A well-behaved origin returns 404 for
+    # the random path, so catch_all stays False and discovery is unchanged.
+    base_status: Optional[int] = None
+    base_is_html = False
+    base_len = 0
+    try:
+        async with session.get(
+            base_url.rstrip("/") + f"/heaven-ca-{secrets.token_hex(8)}",
+            timeout=aiohttp.ClientTimeout(total=8), allow_redirects=False) as base_resp:
+            base_status = base_resp.status
+            base_is_html = "html" in (
+                base_resp.headers.get("Content-Type", "") or "").lower()
+            base_len = int(base_resp.headers.get("Content-Length", 0))
+    except Exception:
+        logger.debug("catch-all baseline probe failed for %s", base_url, exc_info=True)
+    catch_all = base_status == 200 and base_is_html
+    # A server, WAF or CDN in block mode answers the random nonexistent baseline
+    # with an access-controlled status (401/403): it denies EVERY path, so a
+    # probed path returning that same status is not a discovered protected
+    # endpoint, it is the blanket policy. Feeding those phantoms forward made the
+    # API/web scanners run their full battery against the whole COMMON_API_PATHS
+    # list on a host that simply denies everything.
+    base_denies_all = base_status in (401, 403)
 
     async def check_path(path):
         async with sem:
@@ -680,6 +740,19 @@ async def fuzz_endpoints(session: aiohttp.ClientSession, base_url: str,
                     content_type = resp.headers.get("Content-Type", "")
 
                     if status in (200, 201, 301, 302, 401, 403):
+                        # Phantom-endpoint guard: on a confirmed catch-all origin,
+                        # a 200 that is just the same HTML shell (same size class)
+                        # as the random nonexistent baseline is not a real endpoint.
+                        if (catch_all and status == 200
+                                and "html" in content_type.lower()
+                                and abs(content_len - base_len)
+                                <= max(256, int(base_len * 0.10))):
+                            return None
+                        # Blanket-deny origin: an identical 401/403 to the one the
+                        # nonexistent baseline got is the deny policy, not a
+                        # discovered endpoint.
+                        if base_denies_all and status == base_status:
+                            return None
                         return DiscoveredAsset(
                             asset_type="endpoint", value=url,
                             host=base_url, source="endpoint_fuzzing",

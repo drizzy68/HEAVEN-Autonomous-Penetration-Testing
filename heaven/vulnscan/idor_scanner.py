@@ -119,17 +119,35 @@ _SENSITIVE_MARKERS: list[re.Pattern] = [
 ]
 
 
-def _sensitive_markers(body: str) -> list[str]:
-    """Return snippets of any sensitive-data markers found in a response body —
+def _sensitive_markers(body: str, *, limit: int = 8,
+                       strong_only: bool = False) -> list[str]:
+    """Return distinct snippets of any sensitive-data markers in a response body —
     the signal that an altered-ID response actually exposed a record's private
-    data rather than merely returning a different (possibly public) object."""
+    data rather than merely returning a different (possibly public) object.
+
+    Every distinct match is collected (not just the first per pattern) so the
+    IDOR verdict can diff the altered-object response against the attacker's own:
+    a marker present in BOTH (a site-wide footer email, a published contact
+    address) is page furniture, not another user's record, and must not count.
+
+    ``strong_only`` drops the bare-email pattern (``_SENSITIVE_MARKERS[0]``),
+    which matches a contact address anywhere in free text. The unauthenticated-
+    access check has no second response to diff furniture away against (its auth
+    and unauth bodies are identical by construction), so a site-wide footer email
+    on a public page would otherwise read as a protected record. It instead
+    requires a *structured record* marker (a JSON key such as ``"ssn":`` /
+    ``"first_name":`` / ``"credit_card":``) that does not appear on an ordinary
+    public page carrying only a contact email."""
     found: list[str] = []
-    for rx in _SENSITIVE_MARKERS:
-        m = rx.search(body or "")
-        if m:
-            found.append(m.group(0)[:48])
-        if len(found) >= 5:
-            break
+    seen: set[str] = set()
+    for rx in (_SENSITIVE_MARKERS[1:] if strong_only else _SENSITIVE_MARKERS):
+        for m in rx.finditer(body or ""):
+            snippet = m.group(0)[:48]
+            if snippet not in seen:
+                seen.add(snippet)
+                found.append(snippet)
+            if len(found) >= limit:
+                return found
     return found
 
 
@@ -144,10 +162,16 @@ def _idor_verdict(orig_status: int, orig_body: str,
     if not (test_status == 200 and orig_status == 200
             and _body_differs(orig_body, test_body)):
         return None
-    markers = _sensitive_markers(test_body)
-    if markers:
+    # Only sensitive values that appear in the ALTERED-id response but NOT in the
+    # attacker's own (original) response signal a cross-record leak. Markers common
+    # to both responses — a site-wide footer email, a contact phone number — are
+    # page furniture present on every object and would otherwise flag ordinary
+    # public enumeration (e.g. /product/1 → /product/2) as a false IDOR.
+    orig_markers = set(_sensitive_markers(orig_body))
+    new_markers = [m for m in _sensitive_markers(test_body) if m not in orig_markers]
+    if new_markers:
         return ("idor", "medium", 0.6,
-                {"signals": ["sensitive_data_exposed"], "sensitive_markers": markers})
+                {"signals": ["sensitive_data_exposed"], "sensitive_markers": new_markers})
     return ("enumerable_reference", "info", 0.4,
             {"signals": ["object_enumerable"],
              "note": ("A different object was returned for the altered ID, but no "
@@ -436,26 +460,158 @@ class IDORScanner:
             status_a, body_a = await _get(session, url, self._base_headers)
             status_b, body_b = await _get(session, url, self._alt_headers)
 
-        if (status_a == 200 and status_b == 200
+        if not (status_a == 200 and status_b == 200
                 and not _body_differs(body_a, body_b)):
-            # Both tokens get the same response → same object
-            self._add(
-                target=url,
-                vuln_type="idor",
-                title="IDOR: Horizontal privilege escalation (dual-session access)",
-                severity="critical",
-                confidence=0.92,
-                evidence={
-                    "probe_type": "horizontal_privesc",
-                    "param": "session_token",
-                    "detail": "Alternate user token can access this resource with identical response",
-                },
-                remediation=(
-                    "Ensure server-side ownership checks are applied to every object request. "
-                    "Never rely solely on the object ID for authorization."
-                ),
-                cwe="CWE-639",
-            )
+            return
+
+        # Both authenticated users see the same object — but that is only IDOR if
+        # the resource is genuinely access-controlled. Confirm an UNAUTHENTICATED
+        # request is denied (or served different content) first: if an anonymous
+        # client gets the same body, the resource is public/shared (a catalog item,
+        # a published page) and two users seeing it is expected, not a broken-
+        # authorization finding. This mirrors the anon-denied proof the multi-role
+        # access_control audit requires and removes a critical-severity false
+        # positive on shared, ID-bearing endpoints.
+        no_auth = {"User-Agent": "HEAVEN-Scanner/1.0"}
+        async with self._slot():
+            status_anon, body_anon = await _get(session, url, no_auth)
+        if status_anon == 200 and not _body_differs(body_a, body_anon):
+            return  # resource is public, not an authorization break
+
+        self._add(
+            target=url,
+            vuln_type="idor",
+            title="IDOR: Horizontal privilege escalation (dual-session access)",
+            severity="critical",
+            confidence=0.92,
+            evidence={
+                "probe_type": "horizontal_privesc",
+                "param": "session_token",
+                "anonymous_status": status_anon,
+                "detail": "Alternate user token reads this access-controlled resource "
+                          "with an identical response (an anonymous request is denied).",
+            },
+            remediation=(
+                "Ensure server-side ownership checks are applied to every object request. "
+                "Never rely solely on the object ID for authorization."
+            ),
+            cwe="CWE-639",
+        )
+
+    # ── Cross-identity BOLA with ground truth ─────────────────────
+
+    def _id_sites(self, url: str) -> list[tuple[str, str, int]]:
+        """Return (kind, original_id, int_value) for each enumerable integer ID
+        in ``url`` (path segment or object-ish query param). UUIDs are skipped
+        here because they cannot be walked to a neighbour deterministically."""
+        sites: list[tuple[str, str, int]] = []
+        parsed = urlparse(url)
+        for seg in parsed.path.split("/"):
+            if _RE_INT_SEGMENT.match(seg):
+                sites.append(("path", seg, int(seg)))
+        for param, values in parse_qs(parsed.query, keep_blank_values=True).items():
+            v = values[0] if values else ""
+            if _RE_OBJECT_PARAM.match(param) and _RE_INT_SEGMENT.match(v):
+                sites.append((f"param:{param}", v, int(v)))
+        return sites
+
+    def _with_id(self, url: str, kind: str, original: str, new: str) -> str:
+        if kind == "path":
+            return _replace_path_segment(url, original, new)
+        return _replace_qs_param(url, kind.split(":", 1)[1], new)
+
+    async def _test_cross_identity_bola(self, session, url: str) -> None:
+        """True BOLA with a ground-truth RECIPROCAL cross-read.
+
+        Beyond the same-URL swap heuristic: user A owns object X (the URL's own
+        id); we walk to a neighbouring id Y that user B can read. We then prove
+        the authorization boundary is broken in BOTH directions — A reads Y with
+        exactly B's authenticated view of it, and B reads X with exactly A's view
+        of it — while X and Y are genuinely distinct objects (their raw bodies are
+        not equal) and anonymous requests to both are denied. The reciprocal
+        cross-read cannot be explained by shared authenticated content (that would
+        make X and Y identical, excluded here) nor by one account simply owning
+        both, so it is a confirmed object-level authorization break, not a guess.
+
+        Exact (whitespace-normalised) inequality tells X from Y, so a per-user
+        record that differs only in its data fields is still recognised as a
+        distinct object; the ``_body_differs`` tolerance is used only for the
+        cross-view MATCHES, where small per-request noise (nonces, timestamps)
+        must not break the comparison."""
+        if not self._alt_headers:
+            return
+        sites = self._id_sites(url)
+        if not sites:
+            return
+
+        def _n(b: str) -> str:
+            return " ".join((b or "").split())
+
+        kind, original, value = sites[0]
+        async with self._slot():
+            status_ax, body_ax = await _get(session, url, self._base_headers)  # A's own X
+        if status_ax != 200 or not body_ax:
+            return
+
+        for cand in (value + 1, value - 1):
+            if cand <= 0 or cand == value:
+                continue
+            y_url = self._with_id(url, kind, original, str(cand))
+            async with self._slot():
+                status_by, body_by = await _get(session, y_url, self._alt_headers)  # B's own Y
+            if status_by != 200 or not body_by:
+                continue
+            # X and Y must be genuinely DIFFERENT objects (exact inequality, so a
+            # shared/cloned page — identical for both users — is excluded, while a
+            # templated per-user record that differs only in data still qualifies).
+            if _n(body_ax) == _n(body_by):
+                continue
+            async with self._slot():
+                status_ay, body_ay = await _get(session, y_url, self._base_headers)  # A reads Y
+                status_bx, body_bx = await _get(session, url, self._alt_headers)     # B reads X
+                status_anon_y, body_anon_y = await _get(
+                    session, y_url, {"User-Agent": "HEAVEN-Scanner/1.0"})
+                status_anon_x, body_anon_x = await _get(
+                    session, url, {"User-Agent": "HEAVEN-Scanner/1.0"})
+            # Both objects must be access-controlled (anon denied or different).
+            if status_anon_y == 200 and not _body_differs(body_by, body_anon_y):
+                continue
+            if status_anon_x == 200 and not _body_differs(body_ax, body_anon_x):
+                continue
+            # Reciprocal cross-read: A sees B's Y and B sees A's X, each matching
+            # the owner's authenticated view (tolerant of per-request noise).
+            a_reads_y = status_ay == 200 and not _body_differs(body_ay, body_by)
+            b_reads_x = status_bx == 200 and not _body_differs(body_bx, body_ax)
+            if a_reads_y and b_reads_x:
+                self._add(
+                    target=y_url,
+                    vuln_type="bola",
+                    title="BOLA: cross-identity object access (reciprocal, ground-truth)",
+                    severity="critical",
+                    confidence=0.96,
+                    evidence={
+                        "probe_type": "cross_identity_bola",
+                        "param": kind,
+                        "own_object_url": url,
+                        "other_object_url": y_url,
+                        "own_id": original,
+                        "other_id": str(cand),
+                        "anonymous_status_x": status_anon_x,
+                        "anonymous_status_y": status_anon_y,
+                        "proof": (
+                            f"user A read object {cand} with exactly user B's "
+                            f"authenticated view, and user B read object {original} "
+                            "with exactly user A's view (two distinct, access-"
+                            "controlled objects; anonymous access denied) — a "
+                            "confirmed object-level authorization break."),
+                    },
+                    remediation=(
+                        "Enforce object-level authorization on every request: verify "
+                        "the authenticated principal owns or is granted the specific "
+                        "object id before returning it. Do not rely on the id alone."),
+                    cwe="CWE-639",
+                )
+                return
 
     # ── Mass assignment probe ─────────────────────────────────────
 
@@ -515,7 +671,11 @@ class IDORScanner:
         the "authed" and "unauthed" requests are identical, so every id'd 200 URL
         would look like unauth access (a critical-severity false positive). And an
         identical body that carries no sensitive data is just a public page, not a
-        broken-access-control finding.
+        broken-access-control finding. The sensitive-data gate requires a
+        *structured record* marker (``strong_only``) rather than a bare email: a
+        public id'd page (``/blog/42``) that merely shows a contact address in its
+        footer returns the same body with or without auth and would otherwise fire
+        this critical finding, which is page furniture, not a protected object.
         """
         if not self._has_auth:
             return
@@ -532,7 +692,7 @@ class IDORScanner:
 
         if (auth_status == 200 and unauth_status == 200
                 and not _body_differs(auth_body, unauth_body)
-                and _sensitive_markers(unauth_body)):
+                and _sensitive_markers(unauth_body, strong_only=True)):
             self._add(
                 target=url,
                 vuln_type="idor",
@@ -557,6 +717,7 @@ class IDORScanner:
         self,
         targets: list[str],
         forms_by_url: Optional[dict[str, list]] = None,
+        time_budget: Optional[float] = None,
     ) -> dict:
         """
         Run IDOR tests against all targets.
@@ -584,17 +745,31 @@ class IDORScanner:
                 tasks.append(self._test_path_ids(session, url))
                 tasks.append(self._test_param_ids(session, url))
                 tasks.append(self._test_horizontal_privesc(session, url))
+                tasks.append(self._test_cross_identity_bola(session, url))
                 tasks.append(self._test_unauth_access(session, url))
                 if forms:
                     tasks.append(self._test_mass_assignment(session, url, forms))
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Budget-aware: each probe appends to self._findings as it finishes,
+            # so probes completed before the soft deadline are kept; the rest are
+            # cancelled instead of the orchestrator's hard timeout dropping all of
+            # them (same salvage as the injection sweep).
+            from heaven.utils.fanout import gather_budgeted
+            _done, truncated = await gather_budgeted(
+                tasks, time_budget=time_budget)
 
         logger.info(f"IDORScanner: {len(self._findings)} findings")
-        return {
+        out: dict = {
             "findings": self._findings,
             "urls_tested": len(unique),
+            "urls_requested": len(unique),
             "error": None,
         }
+        if truncated:
+            out["budget_exhausted"] = True
+            logger.warning(
+                "IDORScanner: soft budget reached; %d of %d probe(s) completed, "
+                "returning partial findings", len(_done), len(tasks))
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -608,6 +783,7 @@ async def scan_for_idor(
     alt_auth_headers: Optional[dict] = None,
     concurrency: int = 20,
     stealth_level: str = "normal",
+    time_budget: Optional[float] = None,
 ) -> dict:
     """Top-level function called from the orchestrator."""
     # (concurrency, inter-request delay seconds) per stealth level — higher
@@ -632,7 +808,8 @@ async def scan_for_idor(
         alt_auth_headers=alt_auth_headers,
         request_delay=request_delay,
     )
-    return await scanner.scan(targets, forms_by_url=forms_by_url)
+    return await scanner.scan(targets, forms_by_url=forms_by_url,
+                              time_budget=time_budget)
 
 
 def _active_auth_headers() -> Optional[dict]:

@@ -9,6 +9,7 @@ from heaven.net.egress import client_session as _egress_cs  # egress-routed aioh
 
 import asyncio
 import re
+import secrets
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -226,11 +227,21 @@ class GraphQLScanner:
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
                         if resp.status == 200:
-                            data = await resp.json()
-                            if "__schema" in str(data):
-                                schema = data.get("data", {}).get("__schema", {})
-                                types = schema.get("types", [])
-                                mutations = schema.get("mutationType", {})
+                            data = await resp.json(content_type=None)
+                            # Positive evidence only: a real introspection
+                            # response carries a populated ``types`` list under
+                            # ``data.__schema``. A server with introspection
+                            # DISABLED still answers 200 and echoes the field
+                            # name "__schema" back inside an ``errors`` message,
+                            # so a substring match on the whole response body is
+                            # a false positive ("Introspection Enabled: 0 types").
+                            inner = data.get("data") if isinstance(data, dict) else None
+                            schema = inner.get("__schema") if isinstance(inner, dict) else None
+                            types = schema.get("types") if isinstance(schema, dict) else None
+                            if isinstance(types, list) and types:
+                                mutations = schema.get("mutationType") or {}
+                                type_names = [t.get("name") for t in types[:20]
+                                              if isinstance(t, dict)]
                                 findings.append(APIFinding(
                                     target=url, vuln_type="graphql_introspection",
                                     severity="medium", endpoint=endpoint,
@@ -243,7 +254,7 @@ class GraphQLScanner:
                                     confidence=0.95,
                                     evidence={"types_count": len(types),
                                               "has_mutations": bool(mutations),
-                                              "type_names": [t["name"] for t in types[:20]]},
+                                              "type_names": type_names},
                                     remediation="Disable introspection in production.",
                                     cwe="CWE-200",
                                     owasp_api="API3:2023 Broken Object Property Level Authorization",
@@ -482,7 +493,7 @@ class RESTAPIScanner:
     async def test_rate_limiting(cls, session: aiohttp.ClientSession,
                                    url: str) -> list[APIFinding]:
         """Test if API has rate limiting."""
-        findings = []
+        findings: list[APIFinding] = []
         endpoint = f"{url}/api/login"
 
         # Throwaway probe credentials. This test only measures whether the login
@@ -491,16 +502,51 @@ class RESTAPIScanner:
         # mistaken for a real hardcoded secret.
         probe_value = "test"
 
-        async def send_request():
+        async def _probe(target: str):
+            """POST once; return (status, is_html, body_len) or (None, None, None)."""
             try:
                 async with session.post(
-                    endpoint,
+                    target,
                     json={"username": probe_value, "password": probe_value},
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
-                    return resp.status
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    body = await resp.read()
+                    return resp.status, ("html" in ctype), len(body)
             except Exception:
-                return None
+                logger.debug("suppressed non-fatal exception", exc_info=True)
+                return None, None, None
+
+        # Catch-all / soft-endpoint guard. Shared hosting, parked domains and
+        # SPA origins answer EVERY path with the same 200 HTML shell, so a POST
+        # to /api/login that is really just the homepage is not evidence of a
+        # live login API — treating those 200s as "processed" fired no_rate_limit
+        # on every guessed /api, /graphql, /v1 ... path (observed live on a cPanel
+        # host that returned the same homepage for /api/login-<random> as for
+        # /api/login). Confirm the endpoint is DISTINGUISHABLE from a sibling path
+        # that cannot exist, and is an API (not an HTML page), before bursting.
+        ep_status, ep_is_html, ep_len = await _probe(endpoint)
+        if ep_status is None:
+            return findings  # unreachable — no endpoint to rate-limit
+        base_status, _base_html, base_len = await _probe(
+            f"{url}/api/login-{secrets.token_hex(6)}")
+        looks_like_catch_all = (
+            base_status is not None
+            and base_status == ep_status
+            and base_status in (200, 201, 400, 401, 403, 422)
+            and abs((base_len or 0) - (ep_len or 0))
+            <= max(128, int((ep_len or 0) * 0.10))
+        )
+        if ep_is_html or looks_like_catch_all:
+            logger.debug(
+                "rate-limit test: %s is a catch-all/HTML endpoint (ep=%s base=%s "
+                "html=%s), not a live login API; skipping no_rate_limit",
+                endpoint, ep_status, base_status, ep_is_html)
+            return findings
+
+        async def send_request():
+            status, _, _ = await _probe(endpoint)
+            return status
 
         # Send 50 rapid requests
         tasks = [send_request() for _ in range(50)]

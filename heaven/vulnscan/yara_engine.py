@@ -82,16 +82,22 @@ def _ci(pattern: str) -> re.Pattern:
     return re.compile(pattern, re.I | re.S)
 
 
-# A server-side-script context marker (PHP/JSP/ASP tags, an HTTP superglobal, or
-# a code-execution sink). The named-webshell tokens below are only meaningful
-# inside real PHP/JSP/ASPX source, so a match requires one of these to be present
-# too. Without it, a brand token like "FilesMan" or "WSO 2" matches ASCII bytes
-# that occur by chance inside binary media (an MP4 atom, a codec tag) or benign
-# text that merely names a product (for example the "WSO2" software vendor),
-# which is a false positive. A genuine webshell (including a media/PHP polyglot)
+# A PHP script context marker (an open tag, an HTTP superglobal, or a
+# code-execution sink). The named-webshell tokens below are only meaningful
+# inside real PHP source, so a match requires one of these to be present too.
+# Without it, a brand token like "FilesMan" or "WSO 2" matches ASCII bytes that
+# occur by chance inside binary media (an MP4 atom, a codec tag) or benign text
+# that merely names a product (for example the "WSO2" software vendor), which is
+# a false positive. A genuine PHP webshell (including a media/PHP polyglot)
 # always carries this context, so requiring it costs no real detection.
+#
+# The markers here are deliberately PHP-only. The bare ASP/ERB tag ``<%`` is NOT
+# included: these are *PHP* shells (c99/r57/b374k/WSO/FilesMan/IndoXploit/alfa),
+# so ``<%`` is the wrong language, and at two bytes it is common enough in random
+# binary to pair with a stray brand token ~0.4% of the time, a measured false
+# positive on media. ASP/JSP/.NET shells are covered by their own rules below.
 _SCRIPT_CTX = _ci(
-    r"<\?php|<\?=|<%|\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b"
+    r"<\?php|<\?=|\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b"
     r"|\b(?:eval|assert|system|shell_exec|passthru|proc_open|popen|exec|"
     r"base64_decode|gzinflate|str_rot13)\s*\(|Runtime\.getRuntime\s*\(")
 
@@ -127,9 +133,13 @@ _RULES: tuple[_Rule, ...] = (
           all_of=(_ci(r"Runtime\.getRuntime\(\)\.exec"),
                   _ci(r"request\.getParameter")),),
     _Rule("ASPX_Webshell", "critical",
-          "ASP.NET webshell: process launch or code eval from a request value.",
-          any_of=(_ci(r"System\.Diagnostics\.Process\.Start"),
-                  _ci(r"eval\s*\(\s*Request")),),
+          "ASP.NET webshell: a process launch or code eval together with a "
+          "request-value source (Request[...]/QueryString/Form). Bare "
+          "Process.Start is a legitimate .NET API, so a request source is "
+          "required, the same co-occurrence shape the JSP rule uses.",
+          all_of=(_ci(r"System\.Diagnostics\.Process\.Start|\beval\s*\("),
+                  _ci(r"\bRequest\s*(?:\.\s*(?:QueryString|Form|Params|Item|"
+                      r"Cookies|Headers|ServerVariables)|\[)")),),
     _Rule("EICAR_Test_File", "medium",
           "EICAR antivirus test string present. Not malware, but its presence in "
           "served content is a strong signal something is wrong.",
@@ -170,9 +180,11 @@ rule PHP_Webshell_Named {
         $fm = "FilesMan" nocase
         $indo = "IndoXploit" nocase
         $alfa = /alfa\s*team|AlfaShell/ nocase
-        // A named shell is server-side source, so require a script context too;
+        // A named PHP shell is PHP source, so require a PHP script context too;
         // this stops a brand token matching stray bytes in binary media / text.
-        $ctx_tag = /<\?php|<\?=|<%/ nocase
+        // The ASP/ERB tag <% is intentionally excluded: wrong language for these
+        // PHP shells, and two bytes is short enough to hit random media noise.
+        $ctx_tag = /<\?php|<\?=/ nocase
         $ctx_sg = /\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)/ nocase
         $ctx_sink = /(eval|assert|system|shell_exec|passthru|proc_open|popen)\s*\(/ nocase
     condition:

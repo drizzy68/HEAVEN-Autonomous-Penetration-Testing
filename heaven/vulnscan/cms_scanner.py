@@ -27,6 +27,7 @@ from __future__ import annotations
 from heaven.net.egress import client_session as _egress_cs  # egress-routed aiohttp
 
 import re
+from typing import Optional
 from urllib.parse import urlparse
 
 try:
@@ -196,12 +197,17 @@ async def _check_xmlrpc(session, origin: str) -> list[dict]:
             {"answers_rpc": answers_rpc, "pingback_ping": True,
              "method_count": len(methods), "url": url})]
     # RPC is reachable but pingback not confirmed present — still worth a medium.
+    # Keep the prose accurate for BOTH confirmation paths: a listMethods RPC
+    # answer (answers_rpc True) and a GET that only returned WordPress's XML-RPC
+    # banner (answers_rpc False). Asserting the endpoint "answered RPC" in the
+    # banner-only case would overstate what we observed, so claim only that it is
+    # enabled (which the banner alone proves).
     return [_finding(
         url, "xmlrpc_enabled", "medium",
         "WordPress XML-RPC Endpoint Enabled",
-        "The XML-RPC interface (/xmlrpc.php) is enabled and answering remote "
-        "procedure calls. Even without pingback, XML-RPC broadens the attack "
-        "surface (brute-force via system.multicall) and is best disabled unless "
+        "The XML-RPC interface (/xmlrpc.php) is enabled. Even without the "
+        "pingback methods, XML-RPC broadens the attack surface (brute-force "
+        "amplification via system.multicall) and is best disabled unless it is "
         "actively required.",
         0.8,
         {"answers_rpc": answers_rpc, "pingback_ping": False,
@@ -285,7 +291,8 @@ async def scan_origin_cms(session, origin: str) -> list[dict]:
 
 
 async def scan_cms(urls: list[str], timeout: float = _DEFAULT_TIMEOUT,
-                   max_origins: int = 20) -> dict:
+                   max_origins: int = 20,
+                   time_budget: Optional[float] = None) -> dict:
     """Run WordPress/CMS hardening checks over the origins behind ``urls``.
 
     Checks are host-level, so URLs are collapsed to unique ``scheme://host``
@@ -324,7 +331,13 @@ async def scan_cms(urls: list[str], timeout: float = _DEFAULT_TIMEOUT,
             async with sem:
                 findings.extend(await scan_origin_cms(session, origin))
 
-        await asyncio.gather(*[_one(o) for o in origins], return_exceptions=True)
+        # Budget-aware fan-out: origins whose checks finished before the soft
+        # deadline keep their findings (appended to the shared list); the rest
+        # are cancelled rather than losing everything at the hard task timeout.
+        from heaven.utils.fanout import gather_budgeted
+        _results, _truncated = await gather_budgeted(
+            [_one(o) for o in origins], time_budget=time_budget)
+        _audited = len(_results)
 
     # Collapse duplicates (same origin+vuln_type) across overlapping URLs.
     seen_k: set[tuple[str, str]] = set()
@@ -336,4 +349,12 @@ async def scan_cms(urls: list[str], timeout: float = _DEFAULT_TIMEOUT,
             deduped.append(f)
 
     logger.info("CMS scan → %d finding(s) across %d origin(s)", len(deduped), len(origins))
-    return {"findings": deduped, "vulnerabilities": deduped, "total": len(deduped)}
+    out: dict = {"findings": deduped, "vulnerabilities": deduped,
+                 "total": len(deduped),
+                 "urls_requested": len(origins), "urls_audited": _audited}
+    if _truncated:
+        out["budget_exhausted"] = True
+        logger.warning(
+            "CMS scan: soft budget reached; audited %d of %d origin(s), "
+            "returning partial results", _audited, len(origins))
+    return out

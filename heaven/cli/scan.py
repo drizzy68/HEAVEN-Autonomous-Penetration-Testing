@@ -17,7 +17,7 @@ from heaven.cli._helpers import (
     _validate_target_string,
     _verify_authorization,
 )
-from heaven.config import ScanMode, get_config
+from heaven.config import Profile, ScanMode, get_config
 from heaven.utils.logger import HAS_RICH, get_logger, print_banner
 
 logger = get_logger("cli.scan")
@@ -124,6 +124,15 @@ Tip: run `heaven use <engagement>` once to stop repeating --engagement.
 @click.option("--repo", "-r", multiple=True, help="Git repositories to scan")
 @click.option("--cloud", "-c", multiple=True, help="Cloud providers (aws, gcp, azure)")
 @click.option("--mode", "-m", type=click.Choice([m.value for m in ScanMode]), default="full")
+@click.option("--profile", type=click.Choice([p.value for p in Profile]), default="pentest",
+              help="Operating-profile overlay (orthogonal to --mode): 'pentest' "
+                   "(default) keeps classic behaviour; 'bugbounty' enforces strict "
+                   "program scope with an out-of-scope exclusion list, does "
+                   "breadth-first recon within it, advertises a routable OOB "
+                   "collaborator, throttles politely, and defaults to a "
+                   "submission-ready report. With an engagement that has imported "
+                   "program scope and no explicit --target/--url, it seeds the run "
+                   "from that scope.")
 @click.option("--ports", "-p", default="1-65535", help="TCP port range for network scan (default: all ports)")
 @click.option("--udp/--no-udp", "scan_udp", default=False,
               help="Also scan UDP services (DNS/NTP/SNMP/NetBIOS/IKE/SIP/…). Uses nmap "
@@ -206,6 +215,7 @@ def scan(
     target: tuple[str, ...], url: tuple[str, ...],
     repo: tuple[str, ...], cloud: tuple[str, ...],
     mode: str, ports: str, scan_udp: bool, udp_ports: str, stealth: str,
+    profile: str,
     output: str, output_file: Optional[str],
     ad_domain: str, ad_dc: str,
     iot: bool, api_scan: bool, container: bool, mitre_map: bool,
@@ -347,7 +357,47 @@ def scan(
         except Exception:  # noqa: BLE001 — already exists / best-effort
             logger.debug("engagement create was a no-op / already exists", exc_info=True)
 
-        if use_scope:
+        # Carry any out-of-scope entries into the runtime exclusion list so
+        # ScopeGuard subtracts them from everything it would otherwise allow.
+        # Applies to every profile: if the operator marked a host out of scope
+        # (or a bug-bounty import did), it is never actioned.
+        _oos = [e.target for e in engagement_store.list_scope(in_scope_only=False)
+                if not e.in_scope]
+        if _oos:
+            _ex = targets.setdefault("exclude", [])
+            for x in _oos:
+                xl = (x or "").strip().lower()
+                if xl and xl not in _ex:
+                    _ex.append(xl)
+
+        # Bug-bounty profile: when program scope was imported and no explicit
+        # --target/--url was given, seed the run from that scope. Wildcard
+        # (domain) entries also grant subdomain-wide recon via ScopeGuard.
+        _bb_seeded = False
+        if profile == "bugbounty":
+            from heaven.profiles import scope_entries_to_targets
+            _seed = scope_entries_to_targets(
+                engagement_store.list_scope(in_scope_only=False))
+            if _seed["domains"]:
+                _doms = targets.setdefault("domains", [])
+                for d in _seed["domains"]:
+                    if d not in _doms:
+                        _doms.append(d)
+            if not targets["ips"] and not targets["urls"] and (
+                    _seed["ips"] or _seed["urls"]):
+                targets["ips"].extend(_seed["ips"])
+                targets["urls"].extend(_seed["urls"])
+                _bb_seeded = True
+                _print(f"[cyan]Bug-bounty scope:[/cyan] seeded "
+                       f"{len(_seed['ips']) + len(_seed['urls'])} target(s) and "
+                       f"{len(_seed['domains'])} wildcard domain(s) from engagement "
+                       f"scope; {len(_oos)} out-of-scope exclusion(s).")
+
+        # When we seeded straight from the engagement's own scope, the exact
+        # in/out filter below is redundant and would wrongly drop a URL derived
+        # from a *.wildcard entry (it matches hosts exactly, not wildcards).
+        # ScopeGuard enforces the real scope (wildcards + exclusions) at runtime.
+        if use_scope and not _bb_seeded:
             def _scope_kind(t: str) -> str:
                 t = t.strip()
                 if t.startswith(("http://", "https://")):
@@ -458,6 +508,8 @@ def scan(
             _print("  macOS: brew install nmap nuclei")
 
     _print(f"[cyan]Scan mode:[/cyan] {mode.upper()}")
+    if profile != "pentest":
+        _print(f"[cyan]Profile:[/cyan] {profile.upper()}")
     _print(f"[cyan]Stealth:[/cyan] {stealth.upper()}")
     _print(f"[cyan]Targets:[/cyan] {sum(len(v) for v in targets.values() if isinstance(v, list))} specified")
     _print(f"[cyan]Port range:[/cyan] {ports}")
@@ -484,6 +536,14 @@ def scan(
     from heaven.orchestrator import build_full_scan
     config = get_config()
     config.scan_mode = ScanMode(mode)
+
+    # Apply the operating-profile overlay (politeness throttle, OOB routability,
+    # default report). Orthogonal to the scan mode; pentest is a no-op.
+    from heaven.profiles import apply_profile
+    _psettings = apply_profile(config, Profile(profile))
+    # Advertise the profile's OOB reachability to the orchestrator so blind-bug
+    # probes point the target at a routable collaborator when appropriate.
+    targets["oob_routable"] = _psettings.oob_routable
 
     # Pass the mode explicitly so the orchestrator registers only the tasks
     # that belong to it (FULL runs everything; a focused mode runs its
@@ -842,6 +902,19 @@ def scan(
     # twice per scan, and one of the two calls would not match their signature.
 
     _print_inventory(summary.get("assets"))
+
+    # Honest coverage caveats (e.g. a SPA crawled without a headless browser).
+    # These are never findings, but the operator must SEE them: silently returning
+    # a handful of findings on a JS-heavy app that was never rendered is exactly
+    # the "missed findings" failure the tool exists to prevent.
+    for note in summary.get("coverage_notes", []) or []:
+        impact = str(note.get("impact") or "").strip()
+        remediation = str(note.get("remediation") or "").strip()
+        if not impact:
+            continue
+        _print(f"  [yellow]⚠ Reduced coverage[/yellow] [dim]· {impact}[/dim]")
+        if remediation:
+            _print(f"    [dim]For full coverage:[/dim] [cyan]{remediation}[/cyan]")
 
     if engagement_store:
         scan_id = summary.get("scan_id", orch.scan_id)

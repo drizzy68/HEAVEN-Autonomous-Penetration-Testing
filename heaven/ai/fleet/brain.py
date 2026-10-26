@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional, cast
 
 from heaven.ai.llm_gateway import (
     LOCAL_PROVIDERS,
@@ -41,6 +41,50 @@ from heaven.ai.llm_gateway import (
 from heaven.utils.logger import get_logger
 
 logger = get_logger("ai.fleet.brain")
+
+
+class _CountingGateway:
+    """A thin wrapper that records every ``acomplete`` a brain-backed agent makes
+    into the fleet metrics, so ``brain_calls`` reflects the LLM work the fleet
+    actually spent — including the calls the wrapped agents (ReconAgent /
+    VulnHypothesisAgent / AttackChainPlanner) make straight through the gateway,
+    which would otherwise bypass :meth:`FleetBrain.think`'s own counter.
+
+    It delegates everything else to the real gateway (the agents only read
+    ``available`` and call ``acomplete``); a general ``__getattr__`` keeps it a
+    faithful stand-in for any other attribute. Counting mirrors ``think``'s
+    semantics exactly (one count per real call, errors included) so the two paths
+    never double-count the same request."""
+
+    def __init__(self, gateway: LLMGateway, metrics: Any = None):
+        self._gw = gateway
+        self._metrics = metrics
+
+    @property
+    def available(self) -> bool:
+        return bool(self._gw.available)
+
+    async def acomplete(self, req: LLMRequest) -> LLMResponse:
+        try:
+            resp = await self._gw.acomplete(req)
+        except Exception:
+            self._note(ok=False, tokens=0)
+            raise
+        self._note(ok=resp.ok(), tokens=int(getattr(resp, "output_tokens", 0) or 0))
+        return resp
+
+    def _note(self, *, ok: bool, tokens: int) -> None:
+        if self._metrics is None:
+            return
+        try:
+            self._metrics.brain(ok=ok, tokens=tokens)
+        except Exception:  # noqa: BLE001 — a metrics failure never breaks a call
+            logger.debug("counting-gateway metrics note failed", exc_info=True)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for attributes not defined above (the gateway's provider,
+        # model, rate_limited, etc.), so the proxy stays a faithful stand-in.
+        return getattr(self._gw, name)
 
 # Providers that require a key and reach an external service. deepseek speaks the
 # OpenAI-compatible HTTP path but is still a remote, keyed provider (Tier 4).
@@ -71,6 +115,20 @@ class FleetBrain:
         self.metrics = metrics
         self._sem: Optional[asyncio.Semaphore] = None
         self._concurrency = _fleet_llm_concurrency()
+        self._agent_gateway: Optional[_CountingGateway] = None
+
+    @property
+    def agent_gateway(self) -> LLMGateway:
+        """The gateway a brain-backed role hands to its underlying agent.
+
+        It is the real gateway wrapped so each ``acomplete`` the agent makes is
+        counted in ``brain_calls`` (the agents call the gateway directly rather
+        than through :meth:`think`, so without this their LLM work would be
+        invisible to the metrics and the Phase-7 benchmark). Cached per brain so a
+        role always gets the same counting view."""
+        if self._agent_gateway is None:
+            self._agent_gateway = _CountingGateway(self.gateway, self.metrics)
+        return cast(LLMGateway, self._agent_gateway)
 
     # ── tier resolution ───────────────────────────────────────────────────
     @property
@@ -89,10 +147,28 @@ class FleetBrain:
 
     @property
     def available(self) -> bool:
-        """True when a brain is configured and not currently rate-limited. A role
+        """True when a brain is configured and can serve a call right now. A role
         may still get a not-ok response at call time; it must handle that by
-        falling back to its rule-based path."""
-        return self.tier != TIER_DETERMINISTIC and not getattr(self.gateway, "rate_limited", False)
+        falling back to its rule-based path.
+
+        When the primary provider is cooling down (quota/overload breaker armed)
+        the brain is still available if a keyless local fallback — or an explicitly
+        configured one — is ready to take over, so a quota-exhausted free tier
+        keeps the AI roles active on a local model instead of standing down to the
+        deterministic floor."""
+        if self.tier == TIER_DETERMINISTIC:
+            return False
+        gw = self.gateway
+        if not getattr(gw, "rate_limited", False):
+            return True
+        probe = getattr(gw, "has_usable_fallback", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 — availability must never raise
+            logger.debug("fleet brain fallback probe failed", exc_info=True)
+            return False
 
     def describe(self) -> dict:
         """Honest, offline-safe status for ``heaven doctor`` / API health / UI.
@@ -112,7 +188,12 @@ class FleetBrain:
             "concurrency": self._concurrency,
             "local_enabled": False,
             "local_can_enable": False,
+            "fallback_active": False,
         }
+        # When the primary is cooling down but the brain is still available, a
+        # fallback (keyless local or an explicit one) is carrying the AI work — an
+        # honest 'AI still active, now local' signal rather than a dead cloud tier.
+        info["fallback_active"] = bool(info["rate_limited"] and info["available"])
         # Report whether a local brain is present or could be one-tap enabled, so
         # the CLI/UI can offer Tier 2 without the fleet ever blocking on it.
         try:

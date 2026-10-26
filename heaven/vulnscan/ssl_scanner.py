@@ -19,11 +19,24 @@ from heaven.utils.logger import get_logger
 logger = get_logger("ssl_scanner")
 
 # ── Weak cipher patterns ───────────────────────────────────────────────────────
+# Suites with a genuine, named cryptographic weakness: broken, NULL, export or
+# anonymous key exchange / MAC, plus the 64-bit block ciphers (3DES / IDEA) that
+# SWEET32 attacks. Deliberately excluded: SEED and Camellia-128. Both are
+# 128-bit-secure block ciphers with no practical break (OpenSSL rates Camellia-128
+# at HIGH strength), so flagging them as "weak" and claiming they "enable
+# decryption attacks" was a false positive.
 _WEAK_CIPHER_PATTERNS = [
     "NULL", "EXPORT", "LOW", "RC2", "RC4", "DES", "MD5",
     "anon", "aNULL", "eNULL", "ADH", "AECDH",
-    "3DES", "IDEA", "SEED", "CAMELLIA128",
+    "3DES", "IDEA",
 ]
+
+
+def _is_weak_cipher(cipher: str) -> bool:
+    """True when an OpenSSL cipher-suite name carries a known cryptographic
+    weakness (see _WEAK_CIPHER_PATTERNS). Substring match on the suite name,
+    mirroring how testssl/sslyze classify the enumerable TLS <=1.2 suites."""
+    return any(p in cipher for p in _WEAK_CIPHER_PATTERNS)
 _FORWARD_SECRECY_KEXES = {"ECDHE", "DHE", "ECDH", "EDH"}
 # 64-bit block ciphers whose birthday bound makes long TLS sessions decryptable
 # (SWEET32, CVE-2016-2183). 3DES is the one still commonly negotiated; IDEA is
@@ -386,7 +399,7 @@ def _get_ciphers(host: str, port: int, timeout: float = 5.0) -> tuple[list[str],
             with socket.create_connection((host, port), timeout=timeout) as raw:
                 with test_ctx.wrap_socket(raw, server_hostname=host):
                     supported.append(cipher)
-                    if any(p in cipher for p in _WEAK_CIPHER_PATTERNS):
+                    if _is_weak_cipher(cipher):
                         weak.append(cipher)
         except Exception:
             logger.debug("suppressed non-fatal exception", exc_info=True)
@@ -767,8 +780,9 @@ def _check_hsts(host: str, port: int = 443, timeout: float = 8.0) -> tuple[bool,
 
 def _make_finding(host: str, port: int, issue: str, severity: str,
                   title: str, description: str, cve: str = "",
-                  confidence: float = 0.95) -> dict:
-    return {
+                  confidence: float = 0.95,
+                  evidence: Optional[dict] = None) -> dict:
+    out = {
         "target": f"{host}:{port}",
         "vuln_type": issue,
         "title": title,
@@ -778,6 +792,12 @@ def _make_finding(host: str, port: int, issue: str, severity: str,
         "cve_id": cve,
         "source": "ssl_scanner",
     }
+    # Target-specific observed proof so the report's evidence block shows the
+    # real security fact (the absent header, the negotiated SHA-1 sigalg …),
+    # not a generic "identified by the check" fallback.
+    if evidence:
+        out["evidence"] = dict(evidence)
+    return out
 
 
 # ── Public scan function ────────────────────────────────────────────────────────
@@ -909,7 +929,11 @@ def _run_ssl_scan(host: str, port: int) -> SSLResult:
             "BEAST: TLS 1.0 CBC Vulnerability (CVE-2011-3389)",
             "TLS 1.0 with CBC cipher suites is susceptible to chosen-plaintext attacks via BEAST.",
             cve="CVE-2011-3389"))
-    if result.tls10 and not result.tls12 and not result.tls13:
+    # Require TLS 1.1 to also be absent: otherwise "TLS 1.0 Only" is literally
+    # false and would fire alongside the tls11_deprecated finding below (a
+    # self-contradicting pair). A server that speaks TLS 1.1 is handled there.
+    if (result.tls10 and not result.tls11
+            and not result.tls12 and not result.tls13):
         F.append(_make_finding(host, port, "tls10_only", "high",
             "TLS 1.0 Only: Deprecated Protocol",
             "Server only supports TLS 1.0 which is deprecated by RFC 8996 and PCI DSS 3.2.",
@@ -950,7 +974,15 @@ def _run_ssl_scan(host: str, port: int) -> SSLResult:
             "Intermediate, NIST SP 800-52r2). Configure the server to offer only "
             "SHA-256+ signature schemes (e.g. rsa_pss_rsae_sha256, "
             "ecdsa_secp256r1_sha256) and drop rsa_pkcs1_sha1 / ecdsa_sha1.",
-            confidence=0.95))
+            confidence=0.95,
+            evidence={
+                "observed": (
+                    "A TLS 1.2 handshake completed when the client offered ONLY "
+                    f"SHA-1 signature schemes, so the server authenticated its key "
+                    f"exchange with {_pretty}."),
+                "signature_algorithm": result.legacy_sigalg,
+                "tls_version": "1.2",
+            }))
     # Only assert the *absence* of forward secrecy when we actually enumerated at
     # least one TLS ≤1.2 cipher. An empty list means enumeration failed (transient
     # handshake drops), so "no FS" then would be a false positive, not a finding.
@@ -971,7 +1003,15 @@ def _run_ssl_scan(host: str, port: int) -> SSLResult:
             F.append(_make_finding(host, port, "no_hsts", "medium",
                 "HSTS Not Configured",
                 "Missing Strict-Transport-Security header. Browsers will accept HTTP downgrade.",
-                confidence=0.97))
+                confidence=0.97,
+                evidence={
+                    "observed": (
+                        f"The HTTPS response from {host}:{port} carried no "
+                        "Strict-Transport-Security header, so a browser will honour "
+                        "a plaintext-HTTP downgrade of this origin."),
+                    "strict_transport_security": "absent",
+                    "checked_url": f"https://{host}:{port}/",
+                }))
         else:
             # HSTS is present — audit each directive independently. A deep TLS
             # auditor (sslyze / testssl / Qualys SSL Labs) reports every omission,
@@ -1113,7 +1153,8 @@ async def scan_ssl(host: str, port: int = 443) -> dict:
 
 
 async def scan_ssl_targets(targets: list[str],
-                           ports: Optional[list[int]] = None) -> dict:
+                           ports: Optional[list[int]] = None,
+                           time_budget: Optional[float] = None) -> dict:
     """
     Scan multiple hosts/URLs for TLS/SSL issues concurrently.
     targets: list of hostnames or 'host:port' strings.
@@ -1154,14 +1195,26 @@ async def scan_ssl_targets(targets: list[str],
             for p in ports:
                 tasks.append(_scan_one(t, p))
 
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Budget-aware: each handshake appends to the shared list as it finishes, so
+    # hosts completed before the soft deadline are kept; the rest are cancelled
+    # rather than the orchestrator's hard timeout dropping all of them.
+    from heaven.utils.fanout import gather_budgeted
+    _done, truncated = await gather_budgeted(tasks, time_budget=time_budget)
 
     crit  = sum(1 for f in all_findings if f.get("severity") == "critical")
     high  = sum(1 for f in all_findings if f.get("severity") == "high")
-    return {
+    out = {
         "total": len(all_findings),
         "critical": crit,
         "high": high,
         "findings": all_findings,
         "vulnerabilities": all_findings,
+        "urls_requested": len(tasks),
+        "urls_audited": len(_done),
     }
+    if truncated:
+        out["budget_exhausted"] = True
+        logger.warning(
+            "SSL scan: soft budget reached; scanned %d of %d target(s), "
+            "returning partial results", len(_done), len(tasks))
+    return out

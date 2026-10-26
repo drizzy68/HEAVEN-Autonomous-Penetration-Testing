@@ -42,17 +42,24 @@ except ImportError:
     HAS_DNSPYTHON = False
 
 # ── Subdomain takeover: dangling CNAME fingerprints ───────────────────────────
-# (service → response pattern that indicates unclaimed resource)
+# (service → response pattern that indicates an UNCLAIMED resource).
+#
+# Every pattern must be a SPECIFIC unclaimed-resource signature, never a generic
+# HTTP/English token. A claimed-and-live endpoint on these services routinely
+# serves pages containing "404", "Not Found", "unknown", or the provider's own
+# name (asset URLs, badges, default landing pages), so keying a *critical*
+# takeover finding off those bare strings fired on healthy sites. Services whose
+# unclaimed response cannot be told apart from a claimed one by body text alone
+# (Netlify, Azure Traffic Manager, Azure Front Door) are intentionally omitted
+# here rather than matched on a generic "404"/"Not Found".
 _TAKEOVER_FINGERPRINTS: dict[str, list[str]] = {
-    "github.io":              ["There isn't a GitHub Pages site here",
-                               "For root URLs (4xx)"],
+    "github.io":              ["There isn't a GitHub Pages site here"],
     "s3.amazonaws.com":       ["NoSuchBucket", "The specified bucket does not exist"],
-    "s3-website":             ["NoSuchBucket", "404"],
+    "s3-website":             ["NoSuchBucket"],
     "bitbucket.io":           ["Repository not found"],
     "heroku":                 ["No such app", "herokucdn.com"],
     "ghost.io":               ["Used placeholder"],
     "surge.sh":               ["project not found"],
-    "netlify":                ["Not Found", "netlify"],
     "wordpress.com":          ["Do you want to register"],
     "shopify":                ["Sorry, this shop is currently unavailable"],
     "tumblr":                 ["Whatever you were looking for doesn't live here"],
@@ -61,12 +68,10 @@ _TAKEOVER_FINGERPRINTS: dict[str, list[str]] = {
     "fastly":                 ["Fastly error: unknown domain"],
     "azure-api.net":          ["RestError"],
     "cloudfront.net":         ["The request could not be satisfied"],
-    "trafficmanager.net":     ["404"],
     "azurewebsites.net":      ["Microsoft Azure App Service"],
-    "azurefd.net":            ["404"],
     "amazonaws.com":          ["NoSuchBucket", "InvalidBucketName"],
     "elasticbeanstalk.com":   ["NoSuchApplication"],
-    "readthedocs.io":         ["unknown", "no project"],
+    "readthedocs.io":         ["no project"],
     "statuspage.io":          ["Status page not found"],
     "uservoice.com":          ["This UserVoice subdomain"],
     "freshdesk.com":          ["May be taken or retired"],
@@ -115,6 +120,33 @@ def _resolve(name: str, rdtype: str, nameservers: Optional[list[str]] = None,
         return [str(rdata) for rdata in answers]
     except Exception:
         return []
+
+
+def _host_is_nxdomain(name: str, timeout: float = 5.0) -> bool:
+    """True only when ``name`` provably does NOT exist in DNS (NXDOMAIN).
+
+    This is the precise condition for a *registerable* dangling reference: an
+    attacker can claim a name that returns NXDOMAIN. A host that exists but has
+    no A record (``NoAnswer`` — e.g. it is reachable only over IPv6/AAAA, or via
+    other record types), and a transient ``SERVFAIL``/timeout, are deliberately
+    NOT treated as dangling — flagging either was a false positive (and the old
+    A-only ``_resolve`` check even claimed "no A/AAAA record" while never looking
+    at AAAA). Without a real resolver we cannot prove non-existence, so return
+    False (no finding) rather than guess.
+    """
+    if not HAS_DNSPYTHON:
+        return False
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = timeout
+        resolver.resolve(name, "A")
+        return False                      # resolved to an address → exists
+    except dns.resolver.NoAnswer:
+        return False                      # name exists (AAAA/other records) → not dangling
+    except dns.resolver.NXDOMAIN:
+        return True                       # provably does not exist → registerable
+    except Exception:
+        return False                      # SERVFAIL/timeout/etc → cannot prove dangling
 
 
 # ── Zone Transfer (AXFR) ───────────────────────────────────────────────────────
@@ -401,6 +433,17 @@ async def _scan_email_security(domain: str) -> list[dict]:
         ))
     else:
         for sel, record in dkim_found:
+            # The "<1024 bits = factorizable" heuristic only holds for RSA keys.
+            # A k=ed25519 key (RFC 8463) is 256 bits by design and is an elliptic
+            # curve, not an RSA modulus, so it is not factorizable — sizing it
+            # against the RSA threshold flags a modern, correct key as weak (a
+            # false positive). Anchor the k= tag to a tag boundary so base64 in the
+            # p= value cannot be mistaken for it, and default to RSA when absent.
+            ktype_m = re.search(r"(?:^|[;\s\"])k\s*=\s*([A-Za-z0-9]+)",
+                                record, re.IGNORECASE)
+            ktype = ktype_m.group(1).lower() if ktype_m else "rsa"
+            if ktype != "rsa":
+                continue
             key_match = re.search(r"p=([A-Za-z0-9+/=]+)", record)
             if key_match:
                 key_b64 = key_match.group(1)
@@ -515,16 +558,20 @@ def _analyze_mx(domain: str) -> list[dict]:
         if not mx_host:
             continue
 
-        # Try to resolve MX host
-        a_records = _resolve(mx_host, "A")
-        if not a_records:
+        # Flag a dangling MX only when the host PROVABLY does not exist
+        # (NXDOMAIN) — the one state an attacker can register to hijack mail. A
+        # host that resolves only over IPv6 (AAAA, no A), or a transient
+        # SERVFAIL/timeout, is not dangling; the old A-only check mis-reported
+        # both as HIGH while its text wrongly claimed it had checked AAAA.
+        if _host_is_nxdomain(mx_host):
             findings.append(_finding(
                 domain, "mx_dangling", "high",
                 f"Dangling MX Record: {mx_host} Does Not Resolve",
-                f"MX record points to '{mx_host}' which has no A/AAAA record. "
+                f"MX record points to '{mx_host}', which does not exist in DNS "
+                f"(NXDOMAIN — no A/AAAA and the name itself is unregistered). "
                 f"If an attacker registers '{mx_host}', they receive all email for {domain}.",
                 confidence=0.92,
-                evidence={"mx": mx, "unresolvable_host": mx_host},
+                evidence={"mx": mx, "unresolvable_host": mx_host, "dns_state": "NXDOMAIN"},
             ))
 
     return findings
@@ -572,6 +619,12 @@ async def dns_recon(domain: str, enumerate_subdomains: bool = False,
             f"Domain {domain} has no DNSSEC signature records. "
             f"DNS responses can be forged (cache poisoning, Kaminsky attack).",
             confidence=0.95,
+            evidence={
+                "observed": (
+                    f"A DNSSEC validation query for {domain} returned no DNSKEY / "
+                    "RRSIG records, so its DNS responses are unsigned."),
+                "dnssec_enabled": False,
+            },
         ))
 
     # ── SOA analysis ─────────────────────────────────────────────────────────

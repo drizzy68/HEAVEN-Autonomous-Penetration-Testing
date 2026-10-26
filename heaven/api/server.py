@@ -852,14 +852,24 @@ def create_app() -> FastAPI:
             except Exception:
                 logger.debug("suppressed non-fatal exception", exc_info=True)
 
-    app = FastAPI(
+    # Interactive API docs (Swagger at /api/docs, ReDoc at /api/redoc). Exposed by
+    # default for developer convenience — every documented endpoint is still
+    # auth-gated, so the schema alone grants nothing. Set HEAVEN_DISABLE_DOCS=1 to
+    # remove them entirely in production (no Swagger UI, no ReDoc, and no
+    # /openapi.json schema), shrinking the unauthenticated surface to zero.
+    _docs_disabled = os.environ.get("HEAVEN_DISABLE_DOCS", "").lower() in ("1", "true", "yes", "on")
+    _fastapi_kwargs: dict[str, Any] = dict(
         title="HEAVEN Command Centre",
         description="Automated Vulnerability Scanner & Risk Triage Platform",
         version=__version__,
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
         lifespan=lifespan,
     )
+    if _docs_disabled:
+        _fastapi_kwargs.update(docs_url=None, redoc_url=None, openapi_url=None)
+        logger.info("HEAVEN_DISABLE_DOCS set: interactive API docs and /openapi.json disabled")
+    else:
+        _fastapi_kwargs.update(docs_url="/api/docs", redoc_url="/api/redoc")
+    app = FastAPI(**_fastapi_kwargs)
 
     # ── Rate limiting ──
     # Global cap: protects against scrape/DoS. Login endpoint has its own
@@ -972,12 +982,21 @@ def create_app() -> FastAPI:
     )
     _DOCS_PATHS = ("/api/docs", "/api/redoc", "/api/openapi.json")
 
+    # X-XSS-Protection is a legacy header honoured only by old IE / Edge / Safari;
+    # modern browsers dropped their XSS auditor and rely on the strict CSP above.
+    # The default "1; mode=block" is kept because most compliance scanners still
+    # expect it, but operators can follow current OWASP guidance by exporting
+    # HEAVEN_XSS_PROTECTION=0 (disable the buggy legacy auditor) or set it to an
+    # empty string to omit the header entirely. Computed once, not per request.
+    _xss_protection = os.environ.get("HEAVEN_XSS_PROTECTION", "1; mode=block")
+
     class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             response = await call_next(request)
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
-            response.headers["X-XSS-Protection"] = "1; mode=block"
+            if _xss_protection:
+                response.headers["X-XSS-Protection"] = _xss_protection
             response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
             response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
             path = request.url.path
@@ -2646,12 +2665,14 @@ def create_app() -> FastAPI:
         format: str = "html",
         engagement: Optional[str] = None,
         framework: str = "OWASP_TOP10",
+        platform: str = "generic",
         user: User = Depends(require_permission("report.view")),
     ):
         """Generate + download an engagement report. Reuses the exact reporters
         behind `heaven export` / `heaven report`, so CLI and webapp produce the
-        same output. Formats: html, pdf, markdown, csv, json, sarif, burp,
-        proxy-jsonl."""
+        same output. Formats: html, pdf, markdown, csv, json, sarif, junit, burp,
+        proxy-jsonl, bugbounty. `platform` (generic/hackerone/bugcrowd/intigriti)
+        shapes the bugbounty submission wording only."""
         from fastapi import Response
         from fastapi.responses import FileResponse
         from heaven.devsecops.vuln_kb import enrich_finding
@@ -2724,6 +2745,18 @@ def create_app() -> FastAPI:
         raw_assets = _collect_raw_assets(engagement)
         # DNS enumeration (records + subdomains) for the report's DNS section.
         raw_dns = _collect_raw_dns(engagement)
+        # Coverage caveats (a scanner that timed out or hit its soft budget) from
+        # the MOST RECENT scan only — coverage is per-run, so aggregating stale
+        # scans would mislead. Surfaced in the report's "Scan Coverage" section so
+        # partial coverage on a slow host is disclosed, not silently hidden.
+        raw_coverage: list = []
+        with contextlib.suppress(Exception):
+            _store_cov = _read_store(engagement)
+            _recent = _store_cov.list_scans(limit=1)
+            if _recent and _recent[0] and _recent[0].get("summary_json"):
+                _summ = json.loads(_recent[0]["summary_json"])
+                raw_coverage = [c for c in (_summ.get("coverage_notes") or [])
+                                if isinstance(c, dict)]
         # Honest leads (substantiated sub-confirmation observations) for the
         # report's "Leads for manual review" appendix. Never findings, never
         # counted as such — the same channel the CLI export renders, so the
@@ -2738,8 +2771,10 @@ def create_app() -> FastAPI:
             "json": "application/json", "sarif": "application/json",
             "junit": "application/xml",
             "burp": "application/xml", "proxy-jsonl": "application/x-ndjson",
+            "bugbounty": "text/markdown",
         }
-        ext = {"markdown": "md", "proxy-jsonl": "jsonl", "junit": "xml"}
+        ext = {"markdown": "md", "proxy-jsonl": "jsonl", "junit": "xml",
+               "bugbounty": "md"}
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", eng_name)[:60] or "engagement"
         # A recognised compliance framework id (hipaa, uk_gdpr, …) adds a mapped
         # control-coverage section to the html/pdf/markdown deliverables; anything
@@ -2794,7 +2829,8 @@ def create_app() -> FastAPI:
                 body = ComplianceReportGenerator().generate_html_report(
                     findings, engagement_name=eng_name, assets=raw_assets,
                     dns_records=raw_dns, compliance_framework=compliance_fw,
-                    meta=report_meta or None, leads=raw_leads)
+                    meta=report_meta or None, leads=raw_leads,
+                    coverage_notes=raw_coverage)
             elif fmt == "markdown":
                 from heaven.devsecops.evidence import export_findings_markdown
                 body = export_findings_markdown(findings, engagement_name=eng_name,
@@ -2818,6 +2854,13 @@ def create_app() -> FastAPI:
             elif fmt == "proxy-jsonl":
                 from heaven.devsecops.burp_export import export_proxy_history_jsonl
                 body = export_proxy_history_jsonl(findings)
+            elif fmt == "bugbounty":
+                # Submission-ready per-finding markdown (H1/Bugcrowd/Intigriti),
+                # the exact reporter behind `heaven export --format bugbounty`, so
+                # the webapp and CLI hand back the identical deliverable.
+                from heaven.devsecops.evidence import export_findings_bugbounty
+                body = export_findings_bugbounty(
+                    findings, engagement_name=eng_name, platform=platform)
             else:
                 raise HTTPException(400, f"unsupported format: {fmt}")
         except HTTPException:
@@ -3008,10 +3051,14 @@ def create_app() -> FastAPI:
         d["auto_check"] = auto_check
         d["apply_running"] = _update_apply_state["running"]
         d["web_apply_enabled"] = web_apply
+        # Only *genuine* uncommitted edits block a one-click apply. Machine
+        # generated build artifacts the build itself rewrote (e.g. the npm
+        # lockfile — the phantom dirt a fresh install leaves) are reset and
+        # regenerated by the update, so they must not disable the button.
         d["can_apply"] = bool(
             web_apply
             and check.is_git and check.available and check.remote_reachable
-            and not check.dirty and not _update_apply_state["running"])
+            and not check.dirty_blocking and not _update_apply_state["running"])
         return d
 
     @app.post("/api/update/apply")
@@ -3052,9 +3099,9 @@ def create_app() -> FastAPI:
             raise HTTPException(503, f"couldn't reach the remote: {check.error or 'offline?'}")
         if not check.available:
             raise HTTPException(409, f"already up to date (v{check.current_version or '?'})")
-        if check.dirty and not force:
+        if check.dirty_blocking and not force:
             raise HTTPException(
-                409, f"{len(check.dirty_files)} uncommitted change(s) on the server: "
+                409, f"{len(check.dirty_blocking)} uncommitted change(s) on the server: "
                 "refusing to overwrite them. Commit/stash them, or retry with force.")
 
         job_id = uuid.uuid4().hex[:12]
@@ -6336,6 +6383,11 @@ async def _run_scan_background(scan_id: str, req: ScanRequest, *, resume: bool =
                     # DNS enumeration (records + subdomains) for the Assets view's
                     # DNS section and the report's DNS Enumeration section.
                     "dns_records": result.get("dns_records", []),
+                    # Honest coverage caveats — a scanner that timed out or hit its
+                    # soft budget contributed partial/no findings; persist so the
+                    # report and dashboard can disclose that coverage is incomplete
+                    # rather than letting a throttled host look fully scanned.
+                    "coverage_notes": result.get("coverage_notes", []),
                     "severity": {
                         s: sum(1 for f in findings if (f.get("severity") or "info").lower() == s)
                         for s in ("critical", "high", "medium", "low", "info")
@@ -6358,10 +6410,12 @@ async def _run_scan_background(scan_id: str, req: ScanRequest, *, resume: bool =
                 "findings": findings,
                 "assets": result.get("assets", []),
                 "dns_records": result.get("dns_records", []),
+                "coverage_notes": result.get("coverage_notes", []),
                 "summary": {
                     "total_vulnerabilities": len(findings),
                     "total_assets": len(result.get("assets", [])),
                     "elapsed_seconds": result.get("elapsed_seconds", 0),
+                    "coverage_notes": result.get("coverage_notes", []),
                     **{s: sum(1 for f in findings if (f.get("severity") or "info").lower() == s)
                        for s in ("critical", "high", "medium", "low", "info")},
                 },

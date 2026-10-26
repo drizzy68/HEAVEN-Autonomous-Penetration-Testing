@@ -33,6 +33,7 @@ import re
 from typing import Any, Awaitable, Callable, Mapping, Optional
 from urllib.parse import urlparse
 
+from heaven.utils.domains import same_site as _same_site
 from heaven.utils.logger import get_logger
 
 try:
@@ -184,6 +185,17 @@ async def _default_header_fetch(session: "aiohttp.ClientSession", url: str,
         ) as resp:
             if resp.status >= 500:
                 return None
+            # Off-site redirect guard: if the target bounced off its registered
+            # domain (to a CDN / parking / SSO host), the response headers
+            # describe a DIFFERENT server. Mapping that host's Server /
+            # X-Powered-By version into the target origin's EOL + CVE findings
+            # would be a wrong-target false positive. Same guard the web
+            # misconfig / header audits use.
+            final_url = str(getattr(resp, "url", "") or url)
+            if not _same_site(url, final_url):
+                logger.debug("web-tech: %s redirected off-site to %s: skipping headers",
+                             url, final_url)
+                return None
             # Materialise into a plain dict so the value outlives the response.
             return {k: v for k, v in resp.headers.items()}
     except Exception as e:  # noqa: BLE001 - best-effort recon
@@ -199,6 +211,7 @@ async def scan_web_tech(
     max_urls: int = 25,
     timeout: float = 8.0,
     live_feed: Any = None,
+    time_budget: Optional[float] = None,
 ) -> dict:
     """Fingerprint web components across *urls* and raise EOL + CVE findings.
 
@@ -263,8 +276,15 @@ async def scan_web_tech(
     edge_findings: list[dict] = []
     seen_edge: set[tuple[str, str]] = set()
 
+    import time as _time
+    _deadline = (_time.monotonic() + time_budget) \
+        if (time_budget and time_budget > 0) else None
     try:
         for (host, port, _scheme), url in origins.items():
+            if _deadline is not None and _time.monotonic() >= _deadline:
+                logger.warning("web-tech scan: soft budget reached; fingerprinting "
+                               "partial origin set, running EOL/CVE on what was found")
+                break
             headers = await fetch(url)
             if not headers:
                 continue
