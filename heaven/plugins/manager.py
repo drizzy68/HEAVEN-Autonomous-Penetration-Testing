@@ -315,6 +315,26 @@ def run_plugin(name: str, **kwargs: Any) -> Any:
     return func(**kwargs)
 
 
+def _log_hook_failure(plugin: PluginSpec, hook_name: str, exc: BaseException) -> None:
+    """A hook that raises is a plugin defect, not a scan failure.
+
+    Hooks stay isolated so one bad plugin cannot abort a scan, but the failure
+    has to be visible: previously `call_hook` returned an error entry that every
+    caller discarded, and the enrichment/report helpers swallowed the exception
+    outright, so a hook could never run and nothing said so.
+    """
+
+    logger.warning(
+        "Plugin %r hook %s failed (%s): %s: %s",
+        plugin.name,
+        hook_name,
+        plugin.path,
+        type(exc).__name__,
+        exc,
+    )
+    logger.debug("plugin hook traceback", exc_info=True)
+
+
 def call_hook(hook_name: str, **kwargs: Any) -> list[dict[str, Any]]:
     """Run every plugin hook matching a lifecycle name.
 
@@ -334,9 +354,19 @@ def call_hook(hook_name: str, **kwargs: Any) -> list[dict[str, Any]]:
         try:
             payload = hook(**kwargs)
         except Exception as exc:  # pragma: no cover - plugin failures are isolated
-            results.append({"plugin": plugin.name, "hook": hook_name, "status": "error", "error": str(exc)})
+            _log_hook_failure(plugin, hook_name, exc)
+            results.append(
+                {
+                    "plugin": plugin.name,
+                    "hook": hook_name,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             continue
-        results.append({"plugin": plugin.name, "hook": hook_name, "status": "ok", "result": payload})
+        results.append(
+            {"plugin": plugin.name, "hook": hook_name, "status": "ok", "result": payload}
+        )
     return results
 
 
@@ -357,7 +387,8 @@ def enrich_findings(findings: list[dict[str, Any]], **kwargs: Any) -> list[dict[
             continue
         try:
             payload = hook(findings=list(findings), **kwargs)
-        except Exception:
+        except Exception as exc:
+            _log_hook_failure(plugin, "enrich_findings", exc)
             continue
         if isinstance(payload, dict):
             next_findings = payload.get("findings", [])
@@ -380,7 +411,8 @@ def get_report_sections(summary: dict[str, Any], **kwargs: Any) -> list[dict[str
             continue
         try:
             payload = hook(summary=summary, **kwargs)
-        except Exception:
+        except Exception as exc:
+            _log_hook_failure(plugin, "report", exc)
             continue
         if isinstance(payload, dict):
             sections.append(payload)
