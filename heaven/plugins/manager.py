@@ -1,0 +1,275 @@
+"""Plugin discovery and execution for HEAVEN.
+
+Plugins may be placed in any of the following locations:
+- ./heaven_plugins/
+- ~/.heaven/plugins/
+- ~/.config/heaven/plugins/
+- heaven/plugins/ (bundled examples)
+
+A plugin module may export either a dict named PLUGIN or a function named run.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Iterable
+
+
+@dataclass(slots=True)
+class PluginSpec:
+    """Metadata for a discovered HEAVEN plugin."""
+
+    name: str
+    description: str
+    version: str = "0.1.0"
+    author: str = "unknown"
+    source: str = ""
+    path: str = ""
+    entry_point: str = "run"
+    module: ModuleType | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        return f"{self.name} {self.version} — {self.description}"
+
+
+def _candidate_directories(paths: Iterable[str] | None = None) -> list[Path]:
+    candidates: list[Path] = []
+
+    if paths is not None:
+        for raw in paths:
+            p = Path(raw).expanduser()
+            if p not in candidates:
+                candidates.append(p)
+
+    env_value = os.environ.get("HEAVEN_PLUGIN_PATH")
+    if env_value:
+        for raw in env_value.split(os.pathsep):
+            p = Path(raw).expanduser()
+            if p not in candidates:
+                candidates.append(p)
+
+    local_dirs = [
+        Path.cwd() / "heaven_plugins",
+        Path.home() / ".heaven" / "plugins",
+        Path.home() / ".config" / "heaven" / "plugins",
+        Path(__file__).resolve().parent,
+    ]
+    for candidate in local_dirs:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def _load_module(path: Path) -> ModuleType:
+    module_name = f"heaven_plugin_{abs(hash(str(path.resolve())))}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to import plugin from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def demo_enabled() -> bool:
+    """Bundled example plugins stay dormant unless explicitly switched on.
+
+    `heaven/plugins/` is on the default discovery path, so without this the
+    demo plugin would inject a synthetic finding into every real scan and a
+    demo section into every markdown report.
+    """
+
+    return os.environ.get("HEAVEN_ENABLE_DEMO", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _as_plugin_spec(module: ModuleType, source_path: Path) -> PluginSpec | None:
+    plugin_data = getattr(module, "PLUGIN", None)
+    if plugin_data is None:
+        plugin_data = getattr(module, "plugin", None)
+
+    if isinstance(plugin_data, dict):
+        name = str(plugin_data.get("name") or source_path.stem.replace("_", "-"))
+        description = str(plugin_data.get("description") or "No description provided")
+        version = str(plugin_data.get("version") or "0.1.0")
+        author = str(plugin_data.get("author") or "unknown")
+        entry_point = str(plugin_data.get("entry_point") or "run")
+        return PluginSpec(
+            name=name,
+            description=description,
+            version=version,
+            author=author,
+            source=source_path.parent.name,
+            path=str(source_path),
+            entry_point=entry_point,
+            module=module,
+            raw=plugin_data,
+        )
+
+    if callable(plugin_data):
+        name = getattr(plugin_data, "__name__", source_path.stem.replace("_", "-"))
+        return PluginSpec(
+            name=name,
+            description=getattr(plugin_data, "__doc__", "Callable plugin") or "Callable plugin",
+            version="0.1.0",
+            author="unknown",
+            source=source_path.parent.name,
+            path=str(source_path),
+            entry_point="__call__",
+            module=module,
+            raw={"callable": True},
+        )
+
+    callable_obj = getattr(module, "run", None)
+    if callable(callable_obj):
+        name = getattr(module, "PLUGIN_NAME", source_path.stem.replace("_", "-"))
+        description = getattr(module, "PLUGIN_DESCRIPTION", "Built-in HEAVEN plugin")
+        version = getattr(module, "PLUGIN_VERSION", "0.1.0")
+        author = getattr(module, "PLUGIN_AUTHOR", "unknown")
+        return PluginSpec(
+            name=str(name),
+            description=str(description),
+            version=str(version),
+            author=str(author),
+            source=source_path.parent.name,
+            path=str(source_path),
+            entry_point="run",
+            module=module,
+            raw={},
+        )
+
+    return None
+
+
+def discover_plugins(paths: Iterable[str] | None = None) -> list[PluginSpec]:
+    """Scan configured plugin directories and return discovered plugins."""
+
+    plugin_map: dict[str, PluginSpec] = {}
+    for directory in _candidate_directories(paths):
+        if not directory.exists() or not directory.is_dir():
+            continue
+
+        for plugin_file in sorted(directory.rglob("*.py")):
+            if plugin_file.name.startswith("_") and plugin_file.name != "__init__.py":
+                continue
+            if plugin_file.name == "__init__.py":
+                continue
+            try:
+                module = _load_module(plugin_file)
+            except Exception:
+                continue
+            spec = _as_plugin_spec(module, plugin_file)
+            if spec is not None:
+                if spec.raw.get("demo") and not demo_enabled():
+                    continue
+                plugin_map.setdefault(spec.name, spec)
+
+    return sorted(plugin_map.values(), key=lambda spec: spec.name.lower())
+
+
+def load_plugin(name: str, paths: Iterable[str] | None = None) -> PluginSpec:
+    """Load and return a plugin by name."""
+
+    for plugin in discover_plugins(paths):
+        if plugin.name == name:
+            return plugin
+    raise LookupError(f"Plugin '{name}' not found")
+
+
+def run_plugin(name: str, **kwargs: Any) -> Any:
+    """Invoke a plugin by name with keyword arguments."""
+
+    plugin = load_plugin(name)
+    func = None
+    if plugin.module is not None:
+        if isinstance(plugin.raw, dict) and plugin.entry_point in plugin.raw:
+            func = getattr(plugin.module, plugin.entry_point, None)
+        else:
+            func = getattr(plugin.module, plugin.entry_point, None)
+        if func is None and hasattr(plugin.module, "run"):
+            func = plugin.module.run
+    if func is None:
+        raise TypeError(f"Plugin '{name}' does not define a callable entry point")
+    return func(**kwargs)
+
+
+def call_hook(hook_name: str, **kwargs: Any) -> list[dict[str, Any]]:
+    """Run every plugin hook matching a lifecycle name.
+
+    A plugin may export a method named ``hook_<name>`` and receive the same
+    keyword arguments as the lifecycle trigger. This lets scan phases, report
+    generation, and post-processing accumulate plugin results without hardcoding
+    extension points in the core engine.
+    """
+
+    results: list[dict[str, Any]] = []
+    for plugin in discover_plugins():
+        if plugin.module is None:
+            continue
+        hook = getattr(plugin.module, f"hook_{hook_name}", None)
+        if not callable(hook):
+            continue
+        try:
+            payload = hook(**kwargs)
+        except Exception as exc:  # pragma: no cover - plugin failures are isolated
+            results.append({"plugin": plugin.name, "hook": hook_name, "status": "error", "error": str(exc)})
+            continue
+        results.append({"plugin": plugin.name, "hook": hook_name, "status": "ok", "result": payload})
+    return results
+
+
+def enrich_findings(findings: list[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:
+    """Run all plugin finding-enrichment hooks.
+
+    A plugin may provide ``hook_enrich_findings`` and return either a list of
+    finding dicts or a dict with a ``findings`` key. The merged list is returned
+    so the orchestrator can fold plugin-produced evidence into the core result set.
+    """
+
+    enriched: list[dict[str, Any]] = list(findings)
+    for plugin in discover_plugins():
+        if plugin.module is None:
+            continue
+        hook = getattr(plugin.module, "hook_enrich_findings", None)
+        if not callable(hook):
+            continue
+        try:
+            payload = hook(findings=list(findings), **kwargs)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            next_findings = payload.get("findings", [])
+            if isinstance(next_findings, list):
+                enriched.extend(next_findings)
+        elif isinstance(payload, list):
+            enriched.extend(payload)
+    return enriched
+
+
+def get_report_sections(summary: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
+    """Collect plugin-defined markdown- or JSON-friendly report sections."""
+
+    sections: list[dict[str, Any]] = []
+    for plugin in discover_plugins():
+        if plugin.module is None:
+            continue
+        hook = getattr(plugin.module, "hook_report", None)
+        if not callable(hook):
+            continue
+        try:
+            payload = hook(summary=summary, **kwargs)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            sections.append(payload)
+        elif isinstance(payload, list):
+            sections.extend(item for item in payload if isinstance(item, dict))
+    return sections

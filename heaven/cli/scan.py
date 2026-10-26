@@ -189,6 +189,9 @@ Tip: run `heaven use <engagement>` once to stop repeating --engagement.
 @click.option("--watch-tail", is_flag=True,
               help="Headless mode: disable the Rich live HUD and stream a flat log line per "
                    "phase / finding to stdout. Better for CI, ssh sessions, and `tee` piping.")
+@click.option("--plugin", "plugins", multiple=True,
+              help="Run one or more HEAVEN plugins after the scan completes. "
+                   "Can be specified multiple times, e.g. --plugin demo")
 @click.option("--cloud-buckets", is_flag=True,
               help="Also hunt for publicly exposed S3/GCS/Azure buckets guessed from the "
                    "target domain. Off by default, it fires external requests to the cloud "
@@ -212,7 +215,8 @@ def scan(
     low_priv_cookie_file: Optional[str] = None, low_priv_auth: str = "",
     auto_prove: bool = False, verify: bool = False, autonomous: bool = False,
     active_exploit: bool = False,
-    watch_tail: bool = False, cloud_buckets: bool = False, evade: bool = False,
+    watch_tail: bool = False, plugins: tuple[str, ...] = (),
+    cloud_buckets: bool = False, evade: bool = False,
     api_spec_src: Optional[str] = None, api_base_url: Optional[str] = None,
 ) -> None:
     """Launch a vulnerability scan against specified targets."""
@@ -817,6 +821,26 @@ def scan(
     _print(f"\n[green]Scan completed in {summary['elapsed_seconds']}s[/green]")
     _print(f"  Tasks: {summary['completed']}/{summary['total_tasks']} (failed: {summary['failed']})")
 
+    if plugins:
+        try:
+            from heaven.plugins.manager import run_plugin
+            for plugin_name in plugins:
+                _print(f"[cyan]Running plugin:[/cyan] {plugin_name}")
+                result = run_plugin(
+                    plugin_name,
+                    target=(targets.get("urls") or targets.get("ips") or ["unknown"])[0],
+                    summary=summary,
+                    targets=targets,
+                    engagement=engagement,
+                )
+                _print(f"  [green]Plugin result:[/green] {plugin_name}: {json.dumps(result, default=str, sort_keys=True)[:250]}")
+        except Exception as exc:
+            _print(f"[yellow]Plugin execution failed:[/yellow] {exc}")
+
+    # `after_scan` is owned by the orchestrator (heaven/orchestrator.py), which
+    # passes the raw task results. Do not fire it again here: plugins would run
+    # twice per scan, and one of the two calls would not match their signature.
+
     _print_inventory(summary.get("assets"))
 
     if engagement_store:
@@ -900,6 +924,7 @@ def scan(
                 _print(f"  SARIF results written to: {output_file}")
             elif output == "markdown":
                 from heaven.devsecops.evidence import export_findings_markdown
+                from heaven.plugins.manager import get_report_sections
                 # One deduped list (both keys point to it); never concatenate, or
                 # every finding is written to the report twice.
                 findings_in_summary = (
@@ -907,11 +932,21 @@ def scan(
                     or summary.get("findings")
                     or []
                 )
-                # Honest leads appendix uses the same `report_leads` computed
-                # above (calibrated engagement leads when available).
-                Path(output_file).write_text(export_findings_markdown(
+                report_text = export_findings_markdown(
                     findings_in_summary, assets=summary.get("assets"),
-                    leads=report_leads))
+                    leads=report_leads)
+                plugin_sections = get_report_sections(
+                    summary,
+                    target=(targets.get("urls") or targets.get("ips") or ["unknown"])[0],
+                    engagement=engagement,
+                )
+                if plugin_sections:
+                    report_text += "\n\n## Plugin Report Sections\n"
+                    for section in plugin_sections:
+                        title = section.get("title") or section.get("name") or "Plugin Section"
+                        body = section.get("content") or json.dumps(section.get("data", {}), indent=2, default=str)
+                        report_text += f"\n### {title}\n{body}\n"
+                Path(output_file).write_text(report_text)
                 _print(f"  Markdown report written to: {output_file}")
             else:
                 Path(output_file).write_text(json.dumps(summary, indent=2, default=str))

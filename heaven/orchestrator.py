@@ -15,6 +15,7 @@ from typing import Any, Callable, Coroutine, Optional
 
 from heaven.config import HeavenConfig, ScanMode, get_config
 from heaven.feedback import HOST, URL, FeedbackEngine
+from heaven.plugins.manager import call_hook
 from heaven.net.egress import client_session as _egress_cs  # egress-routed aiohttp
 from heaven.ml.ai_brain import BayesianPrioritiser
 # eTLD+1 extraction, shared with auth_scanner via one module so they never drift.
@@ -1251,6 +1252,16 @@ class ScanOrchestrator:
 
         all_results: list[TaskResult] = []
 
+        try:
+            call_hook(
+                "before_scan",
+                scan_id=self.scan_id,
+                targets=self.scan_targets,
+                mode=self.active_mode.value,
+            )
+        except Exception:  # pragma: no cover - plugin side defects should not kill the core scan
+            logger.debug("before_scan hook failed", exc_info=True)
+
         # Heartbeat: keeps the progress bar advancing (via the time-based
         # estimate) during long single tasks, not just at task boundaries.
         heartbeat = asyncio.create_task(self._progress_heartbeat())
@@ -1276,8 +1287,31 @@ class ScanOrchestrator:
                 )
                 break
 
+            try:
+                call_hook(
+                    f"before_phase_{phase.value}",
+                    scan_id=self.scan_id,
+                    phase=phase.value,
+                    targets=self.scan_targets,
+                    mode=self.active_mode.value,
+                )
+            except Exception:  # pragma: no cover - plugin side defects should not kill the core scan
+                logger.debug(f"before_phase hook failed for {phase.value}", exc_info=True)
+
             phase_results = await self._execute_phase(phase)
             all_results.extend(phase_results)
+
+            try:
+                call_hook(
+                    f"after_phase_{phase.value}",
+                    scan_id=self.scan_id,
+                    phase=phase.value,
+                    results=phase_results,
+                    targets=self.scan_targets,
+                    mode=self.active_mode.value,
+                )
+            except Exception:  # pragma: no cover - plugin side defects should not kill the core scan
+                logger.debug(f"after_phase hook failed for {phase.value}", exc_info=True)
 
             if phase == ScanPhase.RECON and self.net_task_id:
                 net_result = self.results.get(self.net_task_id)
@@ -1306,6 +1340,17 @@ class ScanOrchestrator:
             await heartbeat
         except (asyncio.CancelledError, Exception):  # noqa: BLE001 — cleanup only
             logger.debug("progress heartbeat cleanup", exc_info=True)
+
+        try:
+            call_hook(
+                "after_scan",
+                scan_id=self.scan_id,
+                targets=self.scan_targets,
+                mode=self.active_mode.value,
+                results=all_results,
+            )
+        except Exception:  # pragma: no cover - plugin side defects should not kill the core scan
+            logger.debug("after_scan hook failed", exc_info=True)
 
         self.progress.phase = ScanPhase.DONE
         elapsed = self.progress.elapsed_seconds
@@ -1361,12 +1406,19 @@ class ScanOrchestrator:
         # one entry per stable identity so the report, scan list, kill chain
         # and engagement store all agree on the finding count.
         from heaven.engagement import dedup_findings, extract_leads
+        from heaven.plugins.manager import enrich_findings
         # Honest leads: substantiated candidates the FP layer dropped below the
         # finding bar. Captured from the RAW stream before dedup discards them,
         # so a weak-but-real signal reaches a human instead of vanishing. Never
         # findings, never counted as findings.
         all_leads = extract_leads(all_vulns)
         all_vulns = dedup_findings(all_vulns)
+        all_vulns = enrich_findings(
+            all_vulns,
+            scan_id=self.scan_id,
+            targets=self.scan_targets,
+            engagement=getattr(self, "engagement_name", None),
+        )
         # Cross-reference the NVD sweep's KEV / EPSS onto the real findings by CVE
         # id. KEV (CISA Known-Exploited) is a strong triage signal the inline
         # mapper does not carry; only fill gaps, never overwrite a value a
