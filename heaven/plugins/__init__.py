@@ -9,6 +9,7 @@ from __future__ import annotations
 from heaven.plugins.manager import (
     PluginSpec,
     call_hook,
+    clear_plugin_cache,
     demo_enabled,
     discover_plugins,
     enrich_findings,
@@ -20,6 +21,7 @@ from heaven.plugins.manager import (
 __all__ = [
     "PluginSpec",
     "call_hook",
+    "clear_plugin_cache",
     "demo_enabled",
     "discover_plugins",
     "enrich_findings",

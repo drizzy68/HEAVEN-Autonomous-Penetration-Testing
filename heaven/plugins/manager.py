@@ -149,11 +149,48 @@ def _as_plugin_spec(module: ModuleType, source_path: Path) -> PluginSpec | None:
     return None
 
 
+_CACHE_LIMIT = 8
+_CACHE: dict[tuple[Any, ...], list[PluginSpec]] = {}
+
+
+def clear_plugin_cache() -> None:
+    """Forget discovered plugins so the next call re-executes them."""
+
+    _CACHE.clear()
+
+
+def _directory_signature(directories: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
+    """Cheap fingerprint of every candidate plugin file.
+
+    Hooks are called many times per scan, so re-importing modules on each call is
+    wasteful and resets any module-level state. Keying the cache on mtime and size
+    means an edited plugin is still picked up immediately.
+    """
+
+    entries: list[tuple[str, int, int]] = []
+    for directory in directories:
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for plugin_file in sorted(directory.rglob("*.py")):
+            try:
+                stat = plugin_file.stat()
+            except OSError:
+                continue
+            entries.append((str(plugin_file), stat.st_mtime_ns, stat.st_size))
+    return tuple(entries)
+
+
 def discover_plugins(paths: Iterable[str] | None = None) -> list[PluginSpec]:
     """Scan configured plugin directories and return discovered plugins."""
 
+    directories = _candidate_directories(paths)
+    cache_key = (demo_enabled(), _directory_signature(directories))
+    cached = _CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     plugin_map: dict[str, PluginSpec] = {}
-    for directory in _candidate_directories(paths):
+    for directory in directories:
         if not directory.exists() or not directory.is_dir():
             continue
 
@@ -172,7 +209,15 @@ def discover_plugins(paths: Iterable[str] | None = None) -> list[PluginSpec]:
                     continue
                 plugin_map.setdefault(spec.name, spec)
 
-    return sorted(plugin_map.values(), key=lambda spec: spec.name.lower())
+    specs = sorted(plugin_map.values(), key=lambda spec: spec.name.lower())
+    # Bound the cache: a stale signature can never be reached again once its
+    # files changed, so unlimited growth would leak memory in long-lived
+    # processes such as the API server. A handful of entries still keeps
+    # alternating callers (bundled paths vs HEAVEN_PLUGIN_PATH) from thrashing.
+    while len(_CACHE) >= _CACHE_LIMIT:
+        _CACHE.pop(next(iter(_CACHE)))
+    _CACHE[cache_key] = specs
+    return list(specs)
 
 
 def load_plugin(name: str, paths: Iterable[str] | None = None) -> PluginSpec:
