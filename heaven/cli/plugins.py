@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import click
 
-from heaven.plugins.manager import demo_enabled, discover_plugins, load_plugin, run_plugin
+from heaven.plugins.manager import (
+    demo_enabled,
+    discover_plugins,
+    load_plugin,
+    plugin_load_errors,
+    run_plugin,
+)
 
 
 @click.group(name="plugins")
@@ -31,13 +38,23 @@ def list_plugins() -> None:
         click.echo("\nNote: the bundled 'demo' example is disabled because it injects "
                    "synthetic evidence.\n      Set HEAVEN_ENABLE_DEMO=1 to load it.")
 
+    errors = plugin_load_errors()
+    if errors:
+        click.echo(f"\nSkipped {len(errors)} file(s) — these are not loaded:")
+        for error in errors:
+            click.echo(f"  {Path(error.path).name:<18} {error.reason}: {error.error}")
+            click.echo(f"    source: {error.path}")
+
 
 @plugins.command(name="describe")
 @click.argument("name")
 def describe_plugin(name: str) -> None:
     """Show metadata for one plugin."""
 
-    plugin = load_plugin(name)
+    try:
+        plugin = load_plugin(name)
+    except LookupError as exc:
+        raise _missing_plugin_error(exc) from exc
     click.echo(f"Name: {plugin.name}")
     click.echo(f"Version: {plugin.version}")
     click.echo(f"Description: {plugin.description}")
@@ -98,8 +115,28 @@ def run_plugin_cmd(name: str, extra_args: tuple[str, ...]) -> None:
         else:
             params[item] = True
 
-    result = run_plugin(name, **params)
+    try:
+        result = run_plugin(name, **params)
+    except LookupError as exc:
+        raise _missing_plugin_error(exc) from exc
     click.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
+
+
+def _missing_plugin_error(exc: LookupError) -> click.ClickException:
+    """Explain a failed lookup.
+
+    A plugin file that fails to import simply never appears in the list, so a
+    bare "not found" sends you hunting for a typo in the name when the real
+    cause is a broken file.
+    """
+
+    errors = plugin_load_errors()
+    if not errors:
+        return click.ClickException(str(exc))
+    detail = "\n".join(f"  {Path(e.path).name}: {e.reason}: {e.error}" for e in errors)
+    return click.ClickException(
+        f"{exc}\n{len(errors)} plugin file(s) were skipped during discovery:\n{detail}"
+    )
 
 
 def register(cli: click.Group) -> None:

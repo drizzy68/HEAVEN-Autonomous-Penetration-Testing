@@ -7,16 +7,21 @@ Plugins may be placed in any of the following locations:
 - heaven/plugins/ (bundled examples)
 
 A plugin module may export either a dict named PLUGIN or a function named run.
+Files that fail to load are recorded in `plugin_load_errors()` and reported by
+`heaven plugins list`, so a broken plugin is never silently absent.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -35,6 +40,25 @@ class PluginSpec:
 
     def __str__(self) -> str:
         return f"{self.name} {self.version} — {self.description}"
+
+
+@dataclass(slots=True)
+class PluginLoadError:
+    """A plugin file that discovery skipped, and why.
+
+    Discovery is best-effort: one broken plugin must never stop the rest from
+    loading, or take a scan down with it. Recording the failure keeps that
+    isolation without hiding the problem, so `heaven plugins list` can explain
+    why an expected plugin never ran.
+    """
+
+    path: str
+    source: str
+    reason: str  # "import" (the module raised) or "no-entry-point"
+    error: str
+
+    def __str__(self) -> str:
+        return f"{Path(self.path).name}: {self.error}"
 
 
 def _candidate_directories(paths: Iterable[str] | None = None) -> list[Path]:
@@ -150,13 +174,30 @@ def _as_plugin_spec(module: ModuleType, source_path: Path) -> PluginSpec | None:
 
 
 _CACHE_LIMIT = 8
-_CACHE: dict[tuple[Any, ...], list[PluginSpec]] = {}
+_CACHE: dict[tuple[Any, ...], tuple[list[PluginSpec], list[PluginLoadError]]] = {}
+_LAST_ERRORS: list[PluginLoadError] = []
+
+# Discovery also walks this package's own directory, so the manager and the
+# package init must be skipped explicitly: neither exports a plugin, and
+# reporting them as broken plugin files would be pure noise.
+_INTERNAL_FILES = {"__init__.py", Path(__file__).name}
 
 
 def clear_plugin_cache() -> None:
     """Forget discovered plugins so the next call re-executes them."""
 
+    global _LAST_ERRORS
     _CACHE.clear()
+    _LAST_ERRORS = []
+
+
+def plugin_load_errors() -> list[PluginLoadError]:
+    """Files the most recent discovery could not load.
+
+    Returns a copy; discovery keeps its own list so callers cannot mutate it.
+    """
+
+    return list(_LAST_ERRORS)
 
 
 def _directory_signature(directories: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
@@ -181,33 +222,60 @@ def _directory_signature(directories: Iterable[Path]) -> tuple[tuple[str, int, i
 
 
 def discover_plugins(paths: Iterable[str] | None = None) -> list[PluginSpec]:
-    """Scan configured plugin directories and return discovered plugins."""
+    """Scan configured plugin directories and return discovered plugins.
+
+    Files that fail to import are recorded in `plugin_load_errors()` rather than
+    aborting discovery, so one broken plugin cannot hide every healthy one.
+    """
+
+    global _LAST_ERRORS
 
     directories = _candidate_directories(paths)
     cache_key = (demo_enabled(), _directory_signature(directories))
     cached = _CACHE.get(cache_key)
     if cached is not None:
-        return list(cached)
+        specs, errors = cached
+        _LAST_ERRORS = list(errors)
+        return list(specs)
 
     plugin_map: dict[str, PluginSpec] = {}
+    errors: list[PluginLoadError] = []
     for directory in directories:
         if not directory.exists() or not directory.is_dir():
             continue
 
         for plugin_file in sorted(directory.rglob("*.py")):
-            if plugin_file.name.startswith("_") and plugin_file.name != "__init__.py":
+            if plugin_file.name in _INTERNAL_FILES:
                 continue
-            if plugin_file.name == "__init__.py":
+            if plugin_file.name.startswith("_"):
                 continue
             try:
                 module = _load_module(plugin_file)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — isolate one broken plugin
+                logger.warning("Plugin %s failed to import: %s", plugin_file, exc)
+                errors.append(
+                    PluginLoadError(
+                        path=str(plugin_file),
+                        source=plugin_file.parent.name,
+                        reason="import",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
                 continue
             spec = _as_plugin_spec(module, plugin_file)
-            if spec is not None:
-                if spec.raw.get("demo") and not demo_enabled():
-                    continue
-                plugin_map.setdefault(spec.name, spec)
+            if spec is None:
+                errors.append(
+                    PluginLoadError(
+                        path=str(plugin_file),
+                        source=plugin_file.parent.name,
+                        reason="no-entry-point",
+                        error="no PLUGIN dict, plugin callable, or run() function",
+                    )
+                )
+                continue
+            if spec.raw.get("demo") and not demo_enabled():
+                continue
+            plugin_map.setdefault(spec.name, spec)
 
     specs = sorted(plugin_map.values(), key=lambda spec: spec.name.lower())
     # Bound the cache: a stale signature can never be reached again once its
@@ -216,7 +284,8 @@ def discover_plugins(paths: Iterable[str] | None = None) -> list[PluginSpec]:
     # alternating callers (bundled paths vs HEAVEN_PLUGIN_PATH) from thrashing.
     while len(_CACHE) >= _CACHE_LIMIT:
         _CACHE.pop(next(iter(_CACHE)))
-    _CACHE[cache_key] = specs
+    _CACHE[cache_key] = (specs, errors)
+    _LAST_ERRORS = list(errors)
     return list(specs)
 
 
