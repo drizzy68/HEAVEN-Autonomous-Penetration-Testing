@@ -376,6 +376,11 @@ def enrich_findings(findings: list[dict[str, Any]], **kwargs: Any) -> list[dict[
     A plugin may provide ``hook_enrich_findings`` and return either a list of
     finding dicts or a dict with a ``findings`` key. The merged list is returned
     so the orchestrator can fold plugin-produced evidence into the core result set.
+
+    Each hook receives the list as it stands at that point, so plugins run in
+    discovery order and later plugins can build on earlier ones. The orchestrator
+    re-runs dedup afterwards: a plugin that echoes an existing finding must not
+    inflate the finding count.
     """
 
     enriched: list[dict[str, Any]] = list(findings)
@@ -386,7 +391,7 @@ def enrich_findings(findings: list[dict[str, Any]], **kwargs: Any) -> list[dict[
         if not callable(hook):
             continue
         try:
-            payload = hook(findings=list(findings), **kwargs)
+            payload = hook(findings=list(enriched), **kwargs)
         except Exception as exc:
             _log_hook_failure(plugin, "enrich_findings", exc)
             continue

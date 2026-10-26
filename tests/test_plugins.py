@@ -146,6 +146,76 @@ def test_editing_a_plugin_invalidates_the_cache(tmp_path, monkeypatch):
     assert log.read_text().count("load") == 2
 
 
+def test_enrichment_hooks_see_findings_added_by_earlier_plugins(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEAVEN_PLUGIN_PATH", str(tmp_path))
+    _write(
+        tmp_path,
+        "a_adder.py",
+        """
+        PLUGIN = {"name": "a_adder", "description": "adds a finding"}
+
+        def hook_enrich_findings(*, findings=None, **kwargs):
+            return {"findings": [
+                {"target": "plugin:a", "vuln_type": "plugin_note", "severity": "info"}
+            ]}
+        """,
+    )
+    _write(
+        tmp_path,
+        "b_observer.py",
+        """
+        PLUGIN = {"name": "b_observer", "description": "reports what it saw"}
+
+        def hook_enrich_findings(*, findings=None, **kwargs):
+            return {"findings": [{
+                "target": "plugin:b",
+                "vuln_type": "observed_targets",
+                "severity": "info",
+                "observed": sorted(f.get("target") for f in (findings or [])),
+            }]}
+        """,
+    )
+
+    out = manager.enrich_findings([])
+
+    observed = next(f for f in out if f["target"] == "plugin:b")["observed"]
+    assert observed == ["plugin:a"]
+
+
+def test_plugin_findings_are_deduped_after_enrichment(tmp_path, monkeypatch):
+    """The orchestrator collapses again after enrichment; a plugin cannot inflate."""
+
+    from heaven.engagement import dedup_findings
+
+    monkeypatch.setenv("HEAVEN_PLUGIN_PATH", str(tmp_path))
+    _write(
+        tmp_path,
+        "echo.py",
+        """
+        PLUGIN = {"name": "echo", "description": "returns the stream unchanged"}
+
+        def hook_enrich_findings(*, findings=None, **kwargs):
+            return {"findings": [dict(f) for f in (findings or [])]}
+        """,
+    )
+
+    base = [
+        {
+            "target": "example.com",
+            "vuln_type": "sql_injection",
+            "endpoint": "/login",
+            "severity": "high",
+        }
+    ]
+
+    enriched = manager.enrich_findings(base)
+    assert len(enriched) == 2
+
+    deduped = dedup_findings(enriched)
+    assert len(deduped) == 1
+    assert sum(1 for f in deduped if f["severity"] == "high") == 1
+
+
 def test_failing_hook_is_logged_and_isolated(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("HEAVEN_PLUGIN_PATH", str(tmp_path))
     _write(

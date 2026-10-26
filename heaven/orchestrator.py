@@ -1419,6 +1419,12 @@ class ScanOrchestrator:
             targets=self.scan_targets,
             engagement=getattr(self, "engagement_name", None),
         )
+        # Plugins add findings after the collapse above, so collapse again:
+        # a plugin that echoes a finding already in the stream (or two plugins
+        # reporting the same issue) would otherwise inflate the count here, in
+        # the report, and in sev_counts — which is exactly what dedup exists to
+        # prevent. Plugin findings are held to the same bar as scanner output.
+        all_vulns = dedup_findings(all_vulns)
         # Cross-reference the NVD sweep's KEV / EPSS onto the real findings by CVE
         # id. KEV (CISA Known-Exploited) is a strong triage signal the inline
         # mapper does not carry; only fill gaps, never overwrite a value a
