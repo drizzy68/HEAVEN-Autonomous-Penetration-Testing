@@ -26,11 +26,11 @@ function TopologyFallback() {
 // themes. For TEXT/number colours use SEV_TOKEN instead: the theme tokens deepen
 // automatically in light mode so labels never wash out on white.
 const SEV = {
-  critical: { color: '#FF4D6A', label: 'Critical' },
-  high:     { color: '#FF8A3D', label: 'High' },
-  medium:   { color: '#FFC53D', label: 'Medium' },
-  low:      { color: '#38BDF8', label: 'Low' },
-  info:     { color: '#8593AD', label: 'Info' },
+  critical: { color: 'var(--crit)', label: 'Critical' },
+  high:     { color: 'var(--high)', label: 'High' },
+  medium:   { color: 'var(--med)', label: 'Medium' },
+  low:      { color: 'var(--low)', label: 'Low' },
+  info:     { color: 'var(--info)', label: 'Info' },
 }
 const SEV_TOKEN = {
   critical: 'var(--crit)', high: 'var(--high)', medium: 'var(--med)',
@@ -41,13 +41,13 @@ function StatCard({ label, value, color, sub, delay = 0, help }) {
   return (
     <motion.div
       className="stat-card"
-      style={{ color }}
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1], delay }}
+      style={{ color: color }}
+      initial={{ opacity: 0, y: 12, x: -8 }}
+      animate={{ opacity: 1, x: 0, y: 0 }}
+      transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1], delay }}
     >
       <div className="stat-label">{label}{help && <HelpTip term={help} />}</div>
-      <div className="stat-value" style={{ color }}>{value ?? '—'}</div>
+      <div className="stat-value" style={{ color: color }}>{value ?? '—'}</div>
       {sub && <div className="stat-sub">{sub}</div>}
     </motion.div>
   )
@@ -70,7 +70,13 @@ function SeverityBars({ bySeverity, total }) {
             <div className="progress-bar">
               <motion.div
                 className="progress-fill"
-                style={{ background: SEV[s].color, boxShadow: `0 0 10px ${SEV[s].color}66` }}
+                style={{
+                  background: SEV[s].color,
+                  boxShadow: `0 0 10px ${SEV[s].color}66`,
+                  borderRadius: '999px',
+                  height: 8,
+                  width: 0,
+                }}
                 initial={{ width: 0 }}
                 animate={{ width: `${pct}%` }}
                 transition={{ duration: 0.6, ease: 'easeOut' }}
@@ -487,7 +493,7 @@ export default function Dashboard() {
                   </span>
                   <span className="dim" title="Overall risk is rated from confirmed findings; potential (version-inferred) findings are verified separately.">
                     {stats.confirmed_total ?? 0} confirmed
-                    {(stats.potential_total ?? 0) > 0 && <> · {stats.potential_total} potential</>}
+                    {(stats.potential_total ?? 0) > 0 && ` · ${stats.potential_total} potential`}
                   </span>
                 </div>
               )}
@@ -510,8 +516,12 @@ export default function Dashboard() {
               {(bySev.critical ?? 0)} critical · {(bySev.high ?? 0)} high across{' '}
               {stats.scope_targets ?? 0} target{(stats.scope_targets ?? 0) !== 1 ? 's' : ''}.
               {topFindings[0] && (
-                <> Top risk: <span style={{ color: 'var(--text-0)' }}>{topFindings[0].title}</span>{' '}
-                ({Number(topFindings[0].risk_score || 0).toFixed(0)}).</>
+                <>
+                  Top risk: <span style={{ color: 'var(--text-0)' }}>{topFindings[0].title}</span>{' '}
+                  <span className="mono" style={{ color: 'var(--text-2)', fontSize: 11 }}>
+                    ({Number(topFindings[0].risk_score || 0).toFixed(0)}).
+                  </span>
+                </>
               )}
             </div>
             <div style={{ display: 'grid', gap: 8, minWidth: 0 }}>
