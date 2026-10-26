@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
-import { Scans as ScansApi, Demo, Engagement, Engagements, Retest, previewRetestReport } from "../api";
+import { Scans as ScansApi, Demo, Engagements, Retest, previewRetestReport } from "../api";
 import { useToast } from "../components/Toast.jsx";
 import HelpTip from "../components/HelpTip.jsx";
 import TargetsInput, { classifyTarget } from "../components/TargetsInput.jsx";
@@ -61,6 +61,12 @@ export default function Scans() {
   const submittingRef = useRef(false);
   const [launchError, setLaunchError] = useState(null);
   const [launchSuccess, setLaunchSuccess] = useState(null);
+  const [scopePreview, setScopePreview] = useState(null);
+  const [scopePreviewKey, setScopePreviewKey] = useState("");
+  const [scopePreviewError, setScopePreviewError] = useState(null);
+  const [scopePreviewLoading, setScopePreviewLoading] = useState(false);
+  const [confirmedScopeKey, setConfirmedScopeKey] = useState("");
+  const [scopeCheckRevision, setScopeCheckRevision] = useState(0);
   // Bumping this forces the scan list to reload right after a launch/demo,
   // instead of waiting for its 8-second poll.
   const [listRefresh, setListRefresh] = useState(0);
@@ -72,12 +78,6 @@ export default function Scans() {
     const q = searchParams.get("mode");
     if (q && MODE_VALUES.has(q)) setMode(q);
   }, [searchParams]);
-
-  // Engagement summary → scope context in the launcher.
-  const [engSummary, setEngSummary] = useState(null);
-  useEffect(() => { Engagement.summary().then(setEngSummary).catch(() => {}); }, []);
-  const scopeCount = engSummary?.stats?.scope_targets ?? 0;
-  const engName = engSummary?.engagement?.name;
 
   // Load the engagements on disk and default the destination to the active one
   // so the operator always knows (and can change) where findings will be saved.
@@ -106,6 +106,54 @@ export default function Scans() {
     return { valid, invalid };
   }, [targets]);
 
+  const scopeRequestKey = JSON.stringify([
+    destEngagement,
+    [...parsed.valid].sort(),
+    scopeCheckRevision,
+  ]);
+  const currentScopePreview = scopePreviewKey === scopeRequestKey ? scopePreview : null;
+  const requiresScopeConfirmation = Boolean(
+    currentScopePreview?.scope_defined && currentScopePreview.outside_scope?.length,
+  );
+  const scopeExpansionConfirmed = !requiresScopeConfirmation || confirmedScopeKey === scopeRequestKey;
+
+  useEffect(() => {
+    if (!parsed.valid.length || parsed.invalid.length || (engChoice === "__new__" && !destEngagement)) {
+      setScopePreview(null);
+      setScopePreviewKey("");
+      setScopePreviewError(null);
+      setScopePreviewLoading(false);
+      return;
+    }
+
+    const requestKey = JSON.stringify([destEngagement, [...parsed.valid].sort(), scopeCheckRevision]);
+    let cancelled = false;
+    setScopePreview(null);
+    setScopePreviewKey("");
+    setScopePreviewError(null);
+    setScopePreviewLoading(true);
+    const timer = setTimeout(() => {
+      ScansApi.previewScope({ targets: parsed.valid, engagement: destEngagement || undefined })
+        .then((preview) => {
+          if (!cancelled) {
+            setScopePreview(preview);
+            setScopePreviewKey(requestKey);
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) setScopePreviewError(error.message || "Could not check engagement scope");
+        })
+        .finally(() => {
+          if (!cancelled) setScopePreviewLoading(false);
+        });
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [parsed.valid, parsed.invalid.length, destEngagement, engChoice, scopeCheckRevision]);
+
   const [demoRunning, setDemoRunning] = useState(false);
   async function runDemoScan() {
     setDemoRunning(true);
@@ -127,6 +175,13 @@ export default function Scans() {
     if (!authorized) { setLaunchError("You must confirm written authorization before scanning."); return; }
     const rawTargets = targets.split(/[\n,]+/).map(t => t.trim()).filter(Boolean);
     if (rawTargets.length === 0) { setLaunchError("Enter at least one target URL or IP."); return; }
+    if (parsed.invalid.length) { setLaunchError("Fix or remove unrecognized targets before scanning."); return; }
+    if (!currentScopePreview || scopePreviewLoading || scopePreviewError) {
+      setLaunchError("Wait for a successful engagement scope check before scanning."); return;
+    }
+    if (!scopeExpansionConfirmed) {
+      setLaunchError("Review and confirm the out-of-scope targets before scanning."); return;
+    }
     if (engChoice === "__new__" && !destEngagement) {
       setLaunchError("Name the new engagement, or pick an existing one."); return;
     }
@@ -151,6 +206,7 @@ export default function Scans() {
         ...(evade && { evade: true }),
         engagement: destEngagement || undefined,
         i_have_authorization: true,
+        confirm_scope_expansion: requiresScopeConfirmation && scopeExpansionConfirmed,
         // Only send auth fields that are actually filled in.
         ...(cookie.trim()        && { cookie: cookie.trim() }),
         ...(authSpec.trim()      && { auth: authSpec.trim() }),
@@ -203,17 +259,46 @@ export default function Scans() {
                     {parsed.invalid.length > 3 ? "…" : ""}
                   </span>
                 )}
-                {parsed.valid.length > 0 && (
+              </div>
+            )}
+            {scopePreviewLoading && (
+              <div className="dim" role="status" style={{ fontSize: 11, marginTop: 6 }}>
+                Checking targets against the selected engagement scope…
+              </div>
+            )}
+            {scopePreviewError && (
+              <div className="form-banner form-banner-error" role="alert" style={{ marginTop: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <span>Scope check failed; scan launch is paused: {scopePreviewError}</span>
+                <button type="button" className="btn-small" onClick={() => setScopeCheckRevision((n) => n + 1)}>
+                  Retry scope check
+                </button>
+              </div>
+            )}
+            {currentScopePreview && (
+              <div className="field-hints" role="status" style={{ marginTop: 6 }}>
+                <span className="dim">
+                  Scope · <strong>{currentScopePreview.engagement}</strong>
+                  {currentScopePreview.scope_defined
+                    ? ` · ${currentScopePreview.scope_size} defined target${currentScopePreview.scope_size === 1 ? "" : "s"}`
+                    : " · no scope defined yet"}
+                </span>
+                {currentScopePreview.in_scope.length > 0 && (
+                  <span className="field-hint-ok">
+                    ✓ {currentScopePreview.in_scope.length} already in scope: {currentScopePreview.in_scope.join(", ")}
+                  </span>
+                )}
+                {currentScopePreview.outside_scope.length > 0 && (
+                  <span className="field-hint-warn">
+                    ⚠ {currentScopePreview.outside_scope.length} outside current scope: {currentScopePreview.outside_scope.join(", ")}
+                  </span>
+                )}
+                {currentScopePreview.initial_scope.length > 0 && (
                   <span className="dim">
-                    → added to scope{engName ? ` in "${engName}"` : ""} on launch
+                    These targets will establish the initial scope for this engagement on launch.
                   </span>
                 )}
               </div>
             )}
-            <span className="dim" style={{ fontSize: 11, marginTop: 4 }}>
-              Scope: {scopeCount} target{scopeCount !== 1 ? "s" : ""} currently in
-              {engName ? ` "${engName}"` : " this engagement"}.
-            </span>
           </div>
 
           <label className="form-group">
@@ -393,6 +478,20 @@ export default function Scans() {
             </div>
           </details>
 
+          {requiresScopeConfirmation && currentScopePreview && (
+            <label className={"consent-row form-full" + (scopeExpansionConfirmed ? " is-ack" : "")}>
+              <input
+                type="checkbox"
+                checked={scopeExpansionConfirmed}
+                onChange={(e) => setConfirmedScopeKey(e.target.checked ? scopeRequestKey : "")}
+              />
+              <span>
+                I reviewed the targets outside the existing scope and confirm they are authorized.
+                HEAVEN will add them to <strong>{currentScopePreview.engagement}</strong> when the scan starts.
+              </span>
+            </label>
+          )}
+
           <label className={"consent-row form-full" + (authorized ? " is-ack" : "")}>
             <input
               type="checkbox"
@@ -400,7 +499,7 @@ export default function Scans() {
               onChange={e => setAuthorized(e.target.checked)}
             />
             <span>
-              I confirm I have <strong>written authorization</strong> from the target system owner.
+              I confirm I have <strong>written authorization</strong> for every target above.
               Unauthorized scanning is illegal. HEAVEN logs all scan activity.
               <HelpTip text="Active scanning sends real traffic to the target. HEAVEN refuses to launch without this confirmation, and every action is written to an HMAC-signed audit log." />
             </span>
@@ -416,7 +515,7 @@ export default function Scans() {
           <div className="form-full" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <button
               type="submit"
-              disabled={launching || !authorized || parsed.valid.length === 0}
+              disabled={launching || !authorized || parsed.valid.length === 0 || parsed.invalid.length > 0 || scopePreviewLoading || !currentScopePreview || Boolean(scopePreviewError) || !scopeExpansionConfirmed}
               className="btn btn-primary"
             >
               {launching ? "⏳ Launching…" : "⚡ Launch Scan"}

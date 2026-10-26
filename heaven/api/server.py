@@ -108,6 +108,24 @@ def _resolve_stealth_name(level: object) -> str:
     return "normal"
 
 
+def _scan_target_validation_errors(targets: list[str]) -> list[str]:
+    from heaven.security.sanitizer import InputSanitizer
+
+    def _flag(name: str, default: str) -> bool:
+        return os.environ.get(name, default).lower() in ("1", "true", "yes")
+
+    sanitizer = InputSanitizer(
+        allow_private=_flag("HEAVEN_ALLOW_PRIVATE", "1"),
+        allow_localhost=_flag("HEAVEN_ALLOW_LOCALHOST", "1"),
+    )
+    errors: list[str] = []
+    for target in targets:
+        result = sanitizer.sanitize_target(target)
+        if not result.valid:
+            errors.extend(result.errors)
+    return errors
+
+
 class ScanRequest(BaseModel):
     name: str = "HEAVEN Scan"
     targets: list[str] = Field(default_factory=list)
@@ -130,6 +148,10 @@ class ScanRequest(BaseModel):
     stealth_level: int = 3
     engagement: Optional[str] = None
     i_have_authorization: bool = False
+    confirm_scope_expansion: bool = Field(
+        default=False,
+        description="Required when scan targets fall outside an existing engagement scope.",
+    )
     # ── Authenticated scanning (optional) — the target credentials HEAVEN uses
     # to reach pages behind a login. Mirrors the CLI's --cookie-file/--auth and
     # --low-priv-* flags so the web path can run authenticated crawls, IDOR and
@@ -156,6 +178,11 @@ class ScanResponse(BaseModel):
     scan_id: str
     status: str
     message: str
+
+
+class ScanScopePreviewRequest(BaseModel):
+    targets: list[str] = Field(default_factory=list)
+    engagement: Optional[str] = None
 
 
 class FindingStatusUpdate(BaseModel):
@@ -1495,6 +1522,44 @@ def create_app() -> FastAPI:
         )
 
     # ── Scans ──
+    @app.post("/api/scans/scope-preview")
+    async def scan_scope_preview(
+        req: ScanScopePreviewRequest,
+        user: User = Depends(require_permission("scan.create")),
+    ):
+        """Preview how targets compare with the selected engagement's scope."""
+        _validate_http_engagement(req.engagement)
+        engagement = _resolve_engagement_name(req.engagement)
+
+        targets = list(dict.fromkeys(t.strip() for t in req.targets if t.strip()))
+        errors = _scan_target_validation_errors(targets)
+        if errors:
+            raise HTTPException(
+                status_code=400,
+                detail="Target validation failed: " + "; ".join(errors[:10]),
+            )
+
+        try:
+            store = _read_store(engagement)
+            scope_entries = store.list_scope(in_scope_only=False)
+            scope_defined = bool(scope_entries)
+            in_scope = [target for target in targets if store.is_in_scope(target)]
+        except Exception as exc:
+            raise _server_error("Could not read engagement scope", exc) from exc
+
+        outside_scope = (
+            [target for target in targets if target not in in_scope]
+            if scope_defined else []
+        )
+        return {
+            "engagement": engagement,
+            "scope_defined": scope_defined,
+            "scope_size": len(scope_entries),
+            "in_scope": in_scope,
+            "outside_scope": outside_scope,
+            "initial_scope": targets if not scope_defined else [],
+        }
+
     @app.post("/api/scans", response_model=ScanResponse)
     async def create_scan(
         req: ScanRequest,
@@ -1529,20 +1594,7 @@ def create_app() -> FastAPI:
         # private per policy). Localhost/private are allowed by default because
         # scanning your own lab is the common case; set HEAVEN_ALLOW_LOCALHOST=0
         # / HEAVEN_ALLOW_PRIVATE=0 to lock a shared/hosted deployment down.
-        from heaven.security.sanitizer import InputSanitizer
-
-        def _flag(name: str, default: str) -> bool:
-            return os.environ.get(name, default).lower() in ("1", "true", "yes")
-
-        sanitizer = InputSanitizer(
-            allow_private=_flag("HEAVEN_ALLOW_PRIVATE", "1"),
-            allow_localhost=_flag("HEAVEN_ALLOW_LOCALHOST", "1"),
-        )
-        target_errors: list[str] = []
-        for t in ips + urls:
-            r = sanitizer.sanitize_target(t)
-            if not r.valid:
-                target_errors.extend(r.errors)
+        target_errors = _scan_target_validation_errors(ips + urls)
         if target_errors:
             raise HTTPException(
                 status_code=400,
@@ -1556,6 +1608,28 @@ def create_app() -> FastAPI:
         # default) so both the duplicate-submit guard and the active-engagement
         # pointer key off the real target store.
         req.engagement = _resolve_engagement_name(req.engagement)
+
+        scan_scope_targets = list(req.targets or []) + list(req.urls or [])
+        try:
+            scope_store = _read_store(req.engagement)
+            scope_entries = scope_store.list_scope(in_scope_only=False)
+            out_of_scope = [
+                target for target in scan_scope_targets
+                if not scope_store.is_in_scope(target)
+            ] if scope_entries else []
+        except Exception as exc:
+            raise _server_error("Could not verify engagement scope", exc) from exc
+        if out_of_scope and not req.confirm_scope_expansion:
+            examples = ", ".join(out_of_scope[:5])
+            suffix = " …" if len(out_of_scope) > 5 else ""
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Target(s) outside engagement '{req.engagement}' scope: "
+                    f"{examples}{suffix}. Review the scope and confirm its expansion "
+                    "before launching this scan."
+                ),
+            )
 
         # ── Duplicate-submit guard ──
         # One user action can reach this endpoint twice (a double click,
@@ -1609,7 +1683,9 @@ def create_app() -> FastAPI:
         from heaven.security.audit import get_audit_logger, AuditAction, AuditSeverity
         get_audit_logger().log(
             AuditAction.SCAN_STARTED, target=",".join((req.targets or []) + (req.urls or []))[:200],
-            details={"scan_id": scan_id, "mode": req.scan_type}, actor=user.username,
+            details={"scan_id": scan_id, "mode": req.scan_type,
+                     "confirm_scope_expansion": req.confirm_scope_expansion},
+            actor=user.username,
             severity=AuditSeverity.INFO,
         )
 

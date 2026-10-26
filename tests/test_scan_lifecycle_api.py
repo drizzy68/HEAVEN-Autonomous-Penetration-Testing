@@ -51,6 +51,76 @@ def _seed(engagement: str, scans: dict[str, list[dict]]):
     return store
 
 
+def test_scan_scope_preview_uses_requested_engagement(client):
+    from heaven.api.server import _engagement_store_factory
+
+    store = _engagement_store_factory("scope-preview")
+    store.create_engagement(name="scope-preview")
+    store.add_scope("192.168.44.0/24", kind="cidr")
+    store.add_scope("blocked.example.com", kind="host", in_scope=False)
+
+    response = client.post("/api/scans/scope-preview", json={
+        "engagement": "scope-preview",
+        "targets": ["192.168.44.7", "blocked.example.com", "new.example.com"],
+    })
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["engagement"] == "scope-preview"
+    assert body["scope_defined"] is True
+    assert body["scope_size"] == 2
+    assert body["in_scope"] == ["192.168.44.7"]
+    assert body["outside_scope"] == ["blocked.example.com", "new.example.com"]
+    assert body["initial_scope"] == []
+
+
+def test_scan_scope_preview_does_not_create_an_empty_engagement(client):
+    from heaven.config import get_config
+
+    engagement_db = get_config().data_dir / "engagements" / "fresh-preview.db"
+    response = client.post("/api/scans/scope-preview", json={
+        "engagement": "fresh-preview",
+        "targets": ["new.example.com"],
+    })
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["scope_defined"] is False
+    assert body["in_scope"] == []
+    assert body["outside_scope"] == []
+    assert body["initial_scope"] == ["new.example.com"]
+    assert not engagement_db.exists()
+
+
+def test_scan_requires_confirmation_to_expand_existing_scope(client, monkeypatch):
+    from heaven.api import server
+    from heaven.api.server import _engagement_store_factory
+
+    store = _engagement_store_factory("scope-guard")
+    store.create_engagement(name="scope-guard")
+    store.add_scope("192.168.44.0/24", kind="cidr")
+
+    response = client.post("/api/scans", json={
+        "engagement": "scope-guard",
+        "targets": ["192.168.45.7"],
+        "i_have_authorization": True,
+    })
+    assert response.status_code == 409, response.text
+    assert "outside engagement 'scope-guard' scope" in response.json()["detail"]
+
+    async def complete_scan(scan_id, req):
+        server.active_scans[scan_id]["status"] = "completed"
+
+    monkeypatch.setattr(server, "_run_scan_background", complete_scan)
+    response = client.post("/api/scans", json={
+        "engagement": "scope-guard",
+        "targets": ["192.168.45.7"],
+        "i_have_authorization": True,
+        "confirm_scope_expansion": True,
+    })
+    assert response.status_code == 200, response.text
+
+
 def test_report_follows_active_engagement(client):
     """Switching the active engagement makes the report export read *that* store —
     no more spurious 'No findings to report for this engagement'."""

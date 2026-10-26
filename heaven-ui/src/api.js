@@ -308,6 +308,8 @@ export const Engagement = {
 export const Scans = {
   create: (req) =>
     api("/scans", { method: "POST", body: JSON.stringify(req) }),
+  previewScope: (req) =>
+    api("/scans/scope-preview", { method: "POST", body: JSON.stringify(req) }),
   // kind: "pentest" (default — active scans, no SAST/SCA), "sast", "sca", "all".
   list: (limit = 20, kind = "pentest") =>
     api(`/scans?limit=${limit}&kind=${encodeURIComponent(kind)}`),
