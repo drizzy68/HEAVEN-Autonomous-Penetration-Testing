@@ -67,11 +67,11 @@ dependencies = [
     # out-of-the-box experience (JWT sessions, vault encryption, SQLite mode),
     # so they belong in the base install rather than an extra.
     "pyjwt>=2.13.0",       # floor patched: multiple JWT advisories (OSV)
-    "cryptography>=53.0.0",  # floor patched: incl. 2026 advisories thru 53.x (OSV)
+    "cryptography>=50.0.0",  # floor patched: incl. 2026 advisories thru 49.x (OSV)
     "aiosqlite>=0.22.0",
     "defusedxml>=0.7.1",          # XXE-safe XML parsing (untrusted pom.xml / nmap output)
     "cvss>=3.0",                  # reference-grade CVSS v4.0 base scoring (v3.1 is in-house)
-    "javalang>=0.14.0",          # pure-Python Java parser powering the SAST dataflow
+    "javalang>=0.13.0",          # pure-Python Java parser powering the SAST dataflow
                                  # refinement (heaven/vulnscan/java_dataflow.py):
                                  # constant-fold / reachability / interprocedural
                                  # taint over Semgrep's Java results
